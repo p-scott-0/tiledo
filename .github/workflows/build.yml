@@ -1,0 +1,44 @@
+name: Build TileDo
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyqt5 pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name TileDo tiledo.py
+
+      # Always upload as an artifact (accessible from the Actions tab for 30 days)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TileDo-${{ github.sha }}
+          path: dist/TileDo.exe
+          retention-days: 30
+
+      # On a version tag (e.g. v1.2) also create a GitHub Release with the exe attached
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TileDo.exe
+          name: TileDo ${{ github.ref_name }}
+          body: |
+            ## TileDo ${{ github.ref_name }}
+
+            Download **TileDo.exe** below and run it directly on any Windows machine — no installation required.
