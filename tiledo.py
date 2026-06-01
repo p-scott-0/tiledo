@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""TileDo v2 — PyQt5 frameless tile-based to-do"""
+"""TileDo — PyQt5 frameless tile-based to-do"""
+
+APP_VERSION = "1.1.0"
 
 import sys, json, uuid, base64
 from datetime import datetime
@@ -35,7 +37,11 @@ DEFAULT_STAGES = [
     {"id": "blocked",     "name": "Blocked",      "color": "#ff4a68"},
     {"id": "review",      "name": "Review",       "color": "#ffaa38"},
 ]
-DEFAULT_CFG = {"tile_size": 220, "x": 100, "y": 60, "w": 980, "h": 740}
+DEFAULT_CFG = {
+    "tile_size": 220, "x": 100, "y": 60, "w": 980, "h": 740,
+    "priority_bg":  {"high": "#9c1a32", "medium": "#7a5800", "low": "#1a3ea8"},
+    "priority_acc": {"high": "#ff607a", "medium": "#ffe600", "low": "#4aaaff"},
+}
 
 SS = f"""
 * {{ font-family: 'Segoe UI', Arial, sans-serif; font-size: 9pt; color: {TEXT}; outline: 0; }}
@@ -108,11 +114,18 @@ def save(d): DATA_FILE.write_text(json.dumps(d, indent=2))
 
 def load_cfg():
     try:
-        return {**DEFAULT_CFG, **json.loads(CFG_FILE.read_text())} if CFG_FILE.exists() else dict(DEFAULT_CFG)
+        cfg = {**DEFAULT_CFG, **json.loads(CFG_FILE.read_text())} if CFG_FILE.exists() else dict(DEFAULT_CFG)
     except Exception:
-        return dict(DEFAULT_CFG)
+        cfg = dict(DEFAULT_CFG)
+    # Sync priority colours from cfg into the module-level dicts
+    TILE_BG.update(cfg.get("priority_bg",  DEFAULT_CFG["priority_bg"]))
+    TILE_ACC.update(cfg.get("priority_acc", DEFAULT_CFG["priority_acc"]))
+    return cfg
 
-def save_cfg(c): CFG_FILE.write_text(json.dumps(c, indent=2))
+def save_cfg(c):
+    c["priority_bg"]  = dict(TILE_BG)
+    c["priority_acc"] = dict(TILE_ACC)
+    CFG_FILE.write_text(json.dumps(c, indent=2))
 
 def mk_task(title, priority="medium", parent_id=None, recurring=False):
     return {"id": str(uuid.uuid4()), "title": title, "notes": "",
@@ -141,15 +154,14 @@ def display_tasks(d, parent_id, total):
     return focus_tasks(d, parent_id)[:total]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def icon_btn(text, tooltip="", size=28):
+def icon_btn(text, tooltip="", size=24):
     b = QPushButton(text)
     b.setFixedSize(size, size)
     b.setToolTip(tooltip)
-    # No border-radius in the base state — radius clips the glyph edges.
-    # Only apply a subtle radius on hover where it acts as a highlight background.
+    font_pt = max(7, size - 14)   # e.g. size=24 → 10pt, size=28 → 14pt
     b.setStyleSheet(
         f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
-        f"font-size: 13pt; padding: 0; margin: 0; }}"
+        f"font-size: {font_pt}pt; padding: 0; margin: 0; }}"
         f"QPushButton:hover {{ color: {TEXT}; background: {BTN}; border-radius: 5px; }}"
     )
     return b
@@ -237,8 +249,10 @@ class TileCard(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Main content area
-        content = QWidget(); content.setStyleSheet("background: transparent;")
+        # Main content area — explicit bg so priority colour shows fully (not window bg)
+        content = QWidget()
+        content.setAttribute(Qt.WA_StyledBackground, True)
+        content.setStyleSheet(f"background: {bg};")
         vlay = QVBoxLayout(content)
         vlay.setContentsMargins(12, 10, 8, 10)
         vlay.setSpacing(4)
@@ -336,7 +350,7 @@ class TileCard(QFrame):
 
     def _complete(self, state):
         self._task["completed"] = bool(state)
-        save(self._data); self._refresh(); self._app.update_meta()
+        save(self._data); self._refresh(); self._app.refresh()
 
     def _skip(self):
         p_id = self._task.get("parent_id")
@@ -1255,7 +1269,7 @@ class SubtaskListDialog(BaseDialog):
 # ═════════════════════════════════════════════════════════════════════════════
 class SettingsDialog(BaseDialog):
     def __init__(self, parent, data, cfg, app):
-        super().__init__(parent, "Settings", 520, 580)
+        super().__init__(parent, "Settings", 540, 680)
         self._data = data; self._cfg = cfg; self._app = app; self._build()
 
     def _build(self):
@@ -1264,6 +1278,37 @@ class SettingsDialog(BaseDialog):
         self._ts = QSpinBox(); self._ts.setRange(140, 400); self._ts.setValue(self._cfg.get("tile_size",220))
         self._ts.setFixedWidth(80); tr.addWidget(self._ts); tr.addStretch(); self.add_lay(tr)
 
+        # ── Priority colours ───────────────────────────────────────────────
+        sep0 = QFrame(); sep0.setFrameShape(QFrame.HLine); sep0.setStyleSheet(f"color:{BDR};"); self.add(sep0)
+        self.add(self.field_label("PRIORITY COLOURS"))
+        ph = QLabel("Left swatch = tile background · Right swatch = accent / text colour")
+        ph.setStyleSheet(f"color:{DIM}; font-size:8pt;"); self.add(ph)
+
+        self._prio_cvs = {}
+        for prio, label in [("high","High"), ("medium","Medium"), ("low","Low")]:
+            r = QHBoxLayout()
+            r.addWidget(QLabel(f"{label}:"))
+            bg_cv  = [TILE_BG[prio]]
+            acc_cv = [TILE_ACC[prio]]
+
+            def _swatch(cv, parent=self):
+                btn = QPushButton(); btn.setFixedSize(36, 26)
+                btn.setStyleSheet(f"background:{cv[0]};border-radius:6px;border:none;")
+                def pick(checked=False, b=btn, c=cv):
+                    res = QColorDialog.getColor(QColor(c[0]), parent)
+                    if res.isValid():
+                        c[0] = res.name()
+                        b.setStyleSheet(f"background:{res.name()};border-radius:6px;border:none;")
+                btn.clicked.connect(pick)
+                return btn
+
+            r.addWidget(_swatch(bg_cv));  r.addWidget(QLabel("bg"))
+            r.addWidget(_swatch(acc_cv)); r.addWidget(QLabel("accent"))
+            r.addStretch()
+            self._prio_cvs[prio] = (bg_cv, acc_cv)
+            self.add_lay(r)
+
+        # ── Progress stages ────────────────────────────────────────────────
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setStyleSheet(f"color:{BDR};"); self.add(sep)
         self.add(self.field_label("PROGRESS STAGES"))
         hint = QLabel("Click swatch to change colour.  Stages are shown on each tile's pill.")
@@ -1295,6 +1340,12 @@ class SettingsDialog(BaseDialog):
         cl = ghost_btn("Cancel"); cl.clicked.connect(self.reject)
         br.addWidget(sv); br.addStretch(); br.addWidget(cl); self.add_lay(br)
 
+        # ── Version ────────────────────────────────────────────────────────
+        ver = QLabel(f"TileDo  v{APP_VERSION}")
+        ver.setAlignment(Qt.AlignCenter)
+        ver.setStyleSheet(f"color:{DIM}; font-size:8pt; background:transparent;")
+        self.add(ver)
+
     def _add_stage(self):
         new_id = f"stage_{len(self._data['stages'])}"
         self._data["stages"].append({"id":new_id,"name":"New Stage","color":"#888899"})
@@ -1302,6 +1353,10 @@ class SettingsDialog(BaseDialog):
 
     def _save(self):
         self._cfg["tile_size"] = self._ts.value()
+        # Apply priority colours to module-level globals (TileCard reads these)
+        for prio, (bg_cv, acc_cv) in self._prio_cvs.items():
+            TILE_BG[prio]  = bg_cv[0]
+            TILE_ACC[prio] = acc_cv[0]
         for sid,ne,cv in self._srows:
             for s in self._data["stages"]:
                 if s["id"]==sid:
