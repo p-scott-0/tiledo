@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TileDo — PyQt5 frameless tile-based to-do"""
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 import sys, json, uuid, base64
 from datetime import datetime
@@ -261,7 +261,10 @@ class TileCard(QFrame):
         top = QHBoxLayout(); top.setSpacing(4)
         title_lbl = QLabel(self._task["title"])
         title_lbl.setWordWrap(True)
-        title_lbl.setStyleSheet(f"color: {TEXT}; font-size: 10pt; font-weight: 600; background: transparent;")
+        title_lbl.setStyleSheet(
+            f"color: #ffffff; font-size: 10pt; font-weight: 600; "
+            f"background: rgba(0,0,0,115); border-radius: 5px; padding: 3px 7px;"
+        )
         title_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         cog = icon_btn("⚙", "Edit / Notes", 22)
@@ -285,15 +288,19 @@ class TileCard(QFrame):
         # Subtask preview; fall back to notes if no subtasks
         subs = [t for t in self._data["tasks"] if t.get("parent_id") == self._task["id"]]
         pending_subs = [t for t in subs if not t.get("completed")]
+        _sub_ss = (
+            f"color: rgba(255,255,255,200); font-size: 8pt; "
+            f"background: rgba(0,0,0,75); border-radius: 4px; padding: 1px 6px;"
+        )
         if pending_subs:
             for t in pending_subs[:3]:
-                sl = QLabel(f"  ·  {t['title']}")
-                sl.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
+                sl = QLabel(f"· {t['title']}")
+                sl.setStyleSheet(_sub_ss)
                 sl.setWordWrap(True)
                 vlay.addWidget(sl)
             if len(pending_subs) > 3:
-                more = QLabel(f"  ·  +{len(pending_subs)-3} more…")
-                more.setStyleSheet(f"color: {DIM}; font-size: 7pt; background: transparent;")
+                more = QLabel(f"· +{len(pending_subs)-3} more…")
+                more.setStyleSheet(_sub_ss.replace("8pt","7pt"))
                 vlay.addWidget(more)
         else:
             notes = self._task.get("notes", "").strip()
@@ -301,7 +308,7 @@ class TileCard(QFrame):
                 preview = notes[:120] + ("…" if len(notes) > 120 else "")
                 nl = QLabel(preview)
                 nl.setWordWrap(True)
-                nl.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
+                nl.setStyleSheet(_sub_ss)
                 vlay.addWidget(nl)
 
         vlay.addStretch()
