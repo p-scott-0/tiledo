@@ -1,975 +1,973 @@
 #!/usr/bin/env python3
-"""TileDo — PyQt5 frameless tile-based to-do"""
+"""TileDo — tile-based task boards, recurring checklists and reference notes.
 
-APP_VERSION = "1.2.0"
+Design language follows factory-planner (github.com/p-scott-0/factory-planner):
+charcoal surfaces, amber accent, quiet borders, uppercase micro-labels.
+"""
 
-import sys, json, uuid, base64
+import sys, os, re, json, uuid, base64, shutil, subprocess
 from datetime import datetime
 from pathlib import Path
+import urllib.request
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QDialog, QLabel,
-    QPushButton, QToolButton, QMenu, QLineEdit, QTextEdit, QComboBox,
-    QScrollArea, QSizeGrip, QRadioButton, QCheckBox, QSpinBox,
-    QButtonGroup, QColorDialog, QMessageBox, QGraphicsDropShadowEffect,
-    QFileDialog, QStackedWidget, QInputDialog, QLayout,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QSizePolicy,
+    QPushButton, QToolButton, QMenu, QLineEdit, QTextEdit,
+    QScrollArea, QSizeGrip, QCheckBox, QSpinBox, QProgressBar,
+    QColorDialog, QFileDialog, QStackedWidget, QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect, QShortcut, QComboBox, QRadioButton, QButtonGroup,
+    QVBoxLayout, QHBoxLayout, QSizePolicy, QMessageBox,
 )
-from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QEvent, QSize
-from PyQt5.QtGui import QColor, QPixmap, QTextCursor, QTextCharFormat, QTextBlockFormat, QFont, QTextListFormat
+from PyQt5.QtCore import (
+    Qt, QPoint, QTimer, QThread, QMimeData, QEvent, QSharedMemory,
+    pyqtSignal, QBuffer, QIODevice, QRect,
+)
+from PyQt5.QtGui import (
+    QColor, QPalette, QDrag, QTextCursor, QTextCharFormat, QFont,
+    QTextListFormat, QKeySequence, QImage, QPixmap,
+)
 
-DATA_DIR  = Path.home() / ".tiledo"
-DATA_FILE = DATA_DIR / "data.json"
-CFG_FILE  = DATA_DIR / "settings.json"
+APP_VERSION = "2.0.0"
+GITHUB_REPO = "p-scott-0/tiledo"
 
-BG = "#0d0d1a"; BG2 = "#12121f"; BG3 = "#18182c"
-BDR = "#252542"; BDR_H = "#38385a"
-TEXT = "#ddddf8"; DIM = "#72729a"; ACCENT = "#6c63ff"
-DONE_CLR = "#3ecfc6"; BTN = "#1e1e38"; BTN_H = "#28284a"
+# ══════════════════════════════════════════════════════════════════════════════
+# Design tokens — factory-planner palette
+# ══════════════════════════════════════════════════════════════════════════════
+BG     = "#16181a"   # window background
+NAV    = "#111315"   # titlebar / nav strip
+SURF   = "#1f2225"   # card surface
+SURF2  = "#191c1e"   # inset surface (chips, inputs)
+SURF_H = "#24282c"   # card hover
+BDR    = "#2e3236"   # border
+BDR_H  = "#3a3f44"   # border hover / strong
+TEXT   = "#d0d4d8"
+DIM    = "#7a8088"
+FAINT  = "#4a5058"
+ACC    = "#e8982a"   # amber accent
+ACC_H  = "#f5a83a"
+GRN    = "#4caa5c"   # done / progress
+RED    = "#cc4444"
 
-TILE_BG  = {"high": "#9c1a32", "medium": "#7a5800", "low": "#1a3ea8"}
-TILE_ACC = {"high": "#ff607a", "medium": "#ffe600", "low": "#4aaaff"}
-PL = {"high": "HIGH", "medium": "MED", "low": "LOW"}
+PRIO_ORDER = {"high": 0, "medium": 1, "low": 2}
+PRIO_LABEL = {"high": "High", "medium": "Normal", "low": "Low"}
+DEFAULT_PRIO_COLOR = {"high": "#cc4444", "medium": "#e8982a", "low": "#4a90d0"}
+PRIO_COLOR = dict(DEFAULT_PRIO_COLOR)
 
 DEFAULT_STAGES = [
-    {"id": "todo",        "name": "To Do",       "color": "#5a5a80"},
-    {"id": "in_progress", "name": "In Progress",  "color": "#4a78ff"},
-    {"id": "blocked",     "name": "Blocked",      "color": "#ff4a68"},
-    {"id": "review",      "name": "Review",       "color": "#ffaa38"},
+    {"id": "todo",        "name": "To Do",       "color": "#7a8088"},
+    {"id": "in_progress", "name": "In Progress", "color": "#4a90d0"},
+    {"id": "blocked",     "name": "Blocked",     "color": "#cc4444"},
+    {"id": "review",      "name": "Review",      "color": "#e8982a"},
 ]
 DEFAULT_CFG = {
-    "tile_size": 220, "x": 100, "y": 60, "w": 980, "h": 740,
-    "priority_bg":  {"high": "#9c1a32", "medium": "#7a5800", "low": "#1a3ea8"},
-    "priority_acc": {"high": "#ff607a", "medium": "#ffe600", "low": "#4aaaff"},
+    "tile_size": 230, "x": 100, "y": 60, "w": 1000, "h": 720,
+    "auto_update": True, "ui_version": 2,
+    "priority_color": dict(DEFAULT_PRIO_COLOR),
 }
 
-SS = f"""
-* {{ font-family: 'Segoe UI', Arial, sans-serif; font-size: 9pt; color: {TEXT}; outline: 0; }}
-QWidget {{ background: transparent; }}
-QScrollBar:vertical {{ background: {BG2}; width: 5px; border-radius: 3px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: {BDR_H}; border-radius: 3px; min-height: 20px; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
-QScrollBar:horizontal {{ height: 0; border: none; }}
-QLineEdit, QTextEdit {{
-    background: {BG3}; border: 1.5px solid {BDR}; border-radius: 8px;
-    padding: 7px 11px; color: {TEXT}; selection-background-color: {ACCENT};
-}}
-QLineEdit:focus, QTextEdit:focus {{ border-color: {ACCENT}; }}
-QComboBox {{
-    background: {BG3}; border: 1.5px solid {BDR}; border-radius: 8px;
-    padding: 6px 11px; color: {TEXT};
-}}
-QComboBox::drop-down {{ border: none; width: 20px; }}
-QComboBox QAbstractItemView {{
-    background: {BG2}; border: 1px solid {BDR_H}; border-radius: 8px;
-    selection-background-color: {BTN_H}; padding: 4px; outline: 0;
-}}
-QPushButton {{
-    background: {BTN}; color: {DIM}; border: none;
-    border-radius: 7px; padding: 5px 12px; font-size: 8pt;
-}}
-QPushButton:hover {{ background: {BTN_H}; color: {TEXT}; }}
-QPushButton:pressed {{ background: {BG3}; }}
-QRadioButton {{ spacing: 7px; }}
-QRadioButton::indicator {{
-    width: 14px; height: 14px; border-radius: 7px;
-    border: 2px solid {BDR_H}; background: transparent;
-}}
-QRadioButton::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px; border-radius: 4px;
-    border: 2px solid {BDR_H}; background: transparent;
-}}
-QCheckBox::indicator:checked {{ background: {DONE_CLR}; border-color: {DONE_CLR}; }}
-QSpinBox {{
-    background: {BG3}; border: 1.5px solid {BDR}; border-radius: 8px;
-    padding: 5px 8px; color: {TEXT};
-}}
-QSpinBox::up-button, QSpinBox::down-button {{ background: {BTN}; border: none; width: 18px; }}
-QToolButton {{ background: transparent; border: none; }}
-QMenu {{ background: {BG2}; border: 1px solid {BDR_H}; border-radius: 8px; padding: 4px; }}
-QMenu::item {{ padding: 6px 20px; border-radius: 5px; }}
-QMenu::item:selected {{ background: {BTN_H}; }}
-"""
+# ══════════════════════════════════════════════════════════════════════════════
+# Data layer — atomic writes, backup recovery, migrations
+# ══════════════════════════════════════════════════════════════════════════════
+DATA_DIR   = Path(os.environ.get("TILEDO_DATA_DIR", str(Path.home() / ".tiledo")))
+DATA_FILE  = DATA_DIR / "data.json"
+NOTES_FILE = DATA_DIR / "notes.json"
+CFG_FILE   = DATA_DIR / "settings.json"
 
-# ── Data ───────────────────────────────────────────────────────────────────────
-def _empty():
-    return {"tasks": [], "stages": list(DEFAULT_STAGES),
-            "notes_tabs": [{"id": str(uuid.uuid4()), "name": "Notes", "html": ""}]}
-
-def load():
+def _atomic_write(path: Path, payload: dict):
+    """tmp-write + rename so a crash can never leave a half-written file.
+    The previous good file is kept as .bak."""
     DATA_DIR.mkdir(exist_ok=True)
-    try:
-        d = json.loads(DATA_FILE.read_text()) if DATA_FILE.exists() else _empty()
-        # migrate old single-notes format
-        if "notes_html" in d and "notes_tabs" not in d:
-            d["notes_tabs"] = [{"id": str(uuid.uuid4()), "name": "Notes", "html": d.pop("notes_html")}]
-        d.setdefault("notes_tabs", [{"id": str(uuid.uuid4()), "name": "Notes", "html": ""}])
-        return d
-    except Exception:
-        return _empty()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    if path.exists():
+        try:
+            os.replace(path, path.with_suffix(path.suffix + ".bak"))
+        except OSError:
+            pass
+    os.replace(tmp, path)
 
-def save(d): DATA_FILE.write_text(json.dumps(d, indent=2))
-
-def load_cfg():
-    try:
-        cfg = {**DEFAULT_CFG, **json.loads(CFG_FILE.read_text())} if CFG_FILE.exists() else dict(DEFAULT_CFG)
-    except Exception:
-        cfg = dict(DEFAULT_CFG)
-    # Sync priority colours from cfg into the module-level dicts
-    TILE_BG.update(cfg.get("priority_bg",  DEFAULT_CFG["priority_bg"]))
-    TILE_ACC.update(cfg.get("priority_acc", DEFAULT_CFG["priority_acc"]))
-    return cfg
-
-def save_cfg(c):
-    c["priority_bg"]  = dict(TILE_BG)
-    c["priority_acc"] = dict(TILE_ACC)
-    CFG_FILE.write_text(json.dumps(c, indent=2))
+def _read_json(path: Path):
+    """Read a JSON file, falling back to its .bak if the main file is corrupt."""
+    for p in (path, path.with_suffix(path.suffix + ".bak")):
+        try:
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return None
 
 def mk_task(title, priority="medium", parent_id=None, recurring=False):
     return {"id": str(uuid.uuid4()), "title": title, "notes": "",
             "priority": priority, "stage": "todo", "parent_id": parent_id,
-            "recurring": recurring, "completed": False, "order": 9999,
+            "recurring": recurring, "completed": False, "order": 999999,
             "created": datetime.now().isoformat()}
 
-def stage_color(d, sid):
-    for s in d.get("stages", DEFAULT_STAGES):
-        if s["id"] == sid: return s["color"]
-    return "#5a5a80"
+def load_data():
+    d = _read_json(DATA_FILE) or {}
+    d.setdefault("tasks", [])
+    if not d.get("stages"):
+        d["stages"] = [dict(s) for s in DEFAULT_STAGES]
 
-def stage_name(d, sid):
-    for s in d.get("stages", DEFAULT_STAGES):
-        if s["id"] == sid: return s["name"]
-    return sid
+    # migrate v1 notes out of data.json into notes.json
+    if "notes_tabs" in d:
+        if not NOTES_FILE.exists():
+            _atomic_write(NOTES_FILE, {"tabs": d["notes_tabs"]})
+        del d["notes_tabs"]
+    d.pop("notes_html", None)
 
-def focus_tasks(d, parent_id=None):
-    ts = [t for t in d["tasks"] if not t.get("completed") and not t.get("recurring")
-          and t.get("parent_id") == parent_id]
-    ts.sort(key=lambda t: ({"high":0,"medium":1,"low":2}.get(t["priority"],2), t.get("order",9999)))
+    # normalise task fields + repair orphans (parent deleted in v1 left zombies)
+    ids = {t.get("id") for t in d["tasks"]}
+    for t in d["tasks"]:
+        t.setdefault("id", str(uuid.uuid4()))
+        t.setdefault("title", "(untitled)")
+        t.setdefault("notes", "")
+        t.setdefault("stage", "todo")
+        t.setdefault("recurring", False)
+        t.setdefault("completed", False)
+        t.setdefault("order", 999999)
+        if t.get("priority") not in PRIO_ORDER:
+            t["priority"] = "medium"
+        if t.get("parent_id") and t["parent_id"] not in ids:
+            t["parent_id"] = None          # orphan → surface at root so it isn't lost
+        elif "parent_id" not in t:
+            t["parent_id"] = None
+    return d
+
+def save_data(d):
+    _atomic_write(DATA_FILE, d)
+
+def load_notes():
+    n = _read_json(NOTES_FILE) or {}
+    tabs = n.get("tabs") or []
+    if not tabs:
+        tabs = [{"id": str(uuid.uuid4()), "name": "Notes", "html": ""}]
+    return {"tabs": tabs}
+
+def save_notes(n):
+    _atomic_write(NOTES_FILE, n)
+
+def load_cfg():
+    cfg = _read_json(CFG_FILE) or {}
+    cfg = {**DEFAULT_CFG, **cfg}
+    # v1 → v2 palette migration: old saved colours would fight the new theme
+    if cfg.get("ui_version") != 2:
+        cfg["priority_color"] = dict(DEFAULT_PRIO_COLOR)
+        cfg["ui_version"] = 2
+    cfg.pop("priority_bg", None); cfg.pop("priority_acc", None)
+    pc = cfg.get("priority_color") or {}
+    for k in PRIO_ORDER:
+        PRIO_COLOR[k] = pc.get(k, DEFAULT_PRIO_COLOR[k])
+    return cfg
+
+def save_cfg(c):
+    c["priority_color"] = dict(PRIO_COLOR)
+    c["ui_version"] = 2
+    _atomic_write(CFG_FILE, c)
+
+# ── task tree helpers ─────────────────────────────────────────────────────────
+def task_by_id(d, tid):
+    for t in d["tasks"]:
+        if t["id"] == tid:
+            return t
+    return None
+
+def children_of(d, pid, include_done=True):
+    kids = [t for t in d["tasks"]
+            if t.get("parent_id") == pid and not t.get("recurring")]
+    if not include_done:
+        kids = [t for t in kids if not t.get("completed")]
+    kids.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), t.get("order", 0)))
+    return kids
+
+def descendant_ids(d, tid):
+    out, stack = set(), [tid]
+    kids_map = {}
+    for t in d["tasks"]:
+        kids_map.setdefault(t.get("parent_id"), []).append(t["id"])
+    while stack:
+        cur = stack.pop()
+        for k in kids_map.get(cur, []):
+            if k not in out:
+                out.add(k); stack.append(k)
+    return out
+
+def ancestor_chain(d, tid):
+    """[root-most … immediate parent] of task tid."""
+    chain, seen = [], set()
+    t = task_by_id(d, tid)
+    while t and t.get("parent_id") and t["parent_id"] not in seen:
+        seen.add(t["parent_id"])
+        p = task_by_id(d, t["parent_id"])
+        if not p: break
+        chain.append(p); t = p
+    return list(reversed(chain))
+
+def cascade_complete(d, tid, val):
+    t = task_by_id(d, tid)
+    if t: t["completed"] = val
+    if val:
+        for did in descendant_ids(d, tid):
+            dt = task_by_id(d, did)
+            if dt: dt["completed"] = True
+
+def cascade_delete(d, tid):
+    doomed = descendant_ids(d, tid) | {tid}
+    d["tasks"] = [t for t in d["tasks"] if t["id"] not in doomed]
+
+def bucket(d, parent_id, priority, recurring=False):
+    """Pending siblings sharing parent + priority — the reorder unit."""
+    ts = [t for t in d["tasks"]
+          if bool(t.get("recurring")) == recurring
+          and not t.get("completed")
+          and t.get("parent_id") == parent_id
+          and (recurring or t.get("priority") == priority)]
+    ts.sort(key=lambda t: t.get("order", 0))
     return ts
 
-def display_tasks(d, parent_id, total):
-    """Return pending tasks in strict priority order so same-priority tiles fill rows together."""
-    return focus_tasks(d, parent_id)[:total]
+def renumber(ts):
+    for i, t in enumerate(ts):
+        t["order"] = i * 10
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def icon_btn(text, tooltip="", size=24):
+def insert_relative(d, src, target, where):
+    """Reorder src before/after target, adopting target's parent + priority."""
+    rec = bool(src.get("recurring"))
+    src["parent_id"] = target.get("parent_id")
+    if not rec:
+        src["priority"] = target["priority"]
+    b = [t for t in bucket(d, target.get("parent_id"), target.get("priority"), rec)
+         if t["id"] != src["id"]]
+    idx = next((i for i, t in enumerate(b) if t["id"] == target["id"]), len(b))
+    if where == "after":
+        idx += 1
+    b.insert(idx, src)
+    renumber(b)
+
+def nest_under(d, src, new_parent):
+    src["parent_id"] = new_parent["id"]
+    b = bucket(d, new_parent["id"], src["priority"])
+    if src not in b:
+        b.append(src)
+    renumber(b)
+
+def top_pending_count(d):
+    return sum(1 for t in d["tasks"]
+               if not t.get("completed") and not t.get("recurring")
+               and t.get("parent_id") is None)
+
+def stage_by_id(d, sid):
+    for s in d.get("stages", []):
+        if s["id"] == sid:
+            return s
+    return {"id": sid, "name": "—", "color": FAINT}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stylesheet
+# ══════════════════════════════════════════════════════════════════════════════
+SS = f"""
+QLabel {{ color: {TEXT}; background: transparent; }}
+QToolTip {{ background: {NAV}; color: {TEXT}; border: 1px solid {BDR_H}; padding: 4px 8px; }}
+
+QLineEdit, QTextEdit {{
+    background: {BG}; border: 1px solid {BDR_H}; border-radius: 5px;
+    padding: 6px 9px; color: {TEXT}; selection-background-color: {ACC};
+    selection-color: #111;
+}}
+QLineEdit:focus, QTextEdit:focus {{ border-color: {ACC}; }}
+
+QComboBox {{
+    background: {BG}; border: 1px solid {BDR_H}; border-radius: 5px;
+    padding: 5px 9px; color: {TEXT};
+}}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox QAbstractItemView {{
+    background: {SURF}; border: 1px solid {BDR_H}; border-radius: 6px;
+    selection-background-color: #272b2f; color: {TEXT}; padding: 3px; outline: 0;
+}}
+
+QPushButton {{
+    background: #272b2f; color: {TEXT}; border: 1px solid {BDR_H};
+    border-radius: 5px; padding: 6px 13px; font-weight: 600;
+}}
+QPushButton:hover {{ background: #2e3338; }}
+QPushButton:pressed {{ background: {SURF2}; }}
+
+QCheckBox {{ background: transparent; spacing: 7px; color: {TEXT}; }}
+QCheckBox::indicator {{
+    width: 16px; height: 16px; border-radius: 8px;
+    border: 2px solid {BDR_H}; background: transparent;
+}}
+QCheckBox::indicator:hover  {{ border-color: {DIM}; }}
+QCheckBox::indicator:checked {{ background: {GRN}; border-color: {GRN}; }}
+
+QRadioButton {{ background: transparent; spacing: 7px; color: {TEXT}; }}
+QRadioButton::indicator {{
+    width: 13px; height: 13px; border-radius: 7px;
+    border: 2px solid {BDR_H}; background: transparent;
+}}
+QRadioButton::indicator:checked {{ background: {ACC}; border-color: {ACC}; }}
+
+QSpinBox {{
+    background: {BG}; border: 1px solid {BDR_H}; border-radius: 5px;
+    padding: 4px 7px; color: {TEXT};
+}}
+QSpinBox::up-button, QSpinBox::down-button {{ background: #272b2f; border: none; width: 17px; }}
+
+QMenu {{ background: {SURF}; border: 1px solid {BDR_H}; border-radius: 7px; padding: 5px; }}
+QMenu::item {{ padding: 6px 22px 6px 14px; border-radius: 4px; color: {TEXT}; background: transparent; }}
+QMenu::item:selected {{ background: #272b2f; }}
+QMenu::separator {{ height: 1px; background: {BDR}; margin: 4px 8px; }}
+
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: #33383e; border-radius: 4px; min-height: 24px; }}
+QScrollBar::handle:vertical:hover {{ background: #454b52; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ background: #33383e; border-radius: 4px; min-width: 24px; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
+
+QProgressBar {{
+    background: {BG}; border: 1px solid {BDR}; border-radius: 4px;
+    height: 10px; text-align: center; color: {DIM}; font-size: 8pt;
+}}
+QProgressBar::chunk {{ background: {ACC}; border-radius: 3px; }}
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Small shared widgets
+# ══════════════════════════════════════════════════════════════════════════════
+def btn_primary(text):
+    b = QPushButton(text)
+    b.setCursor(Qt.PointingHandCursor)
+    b.setStyleSheet(
+        f"QPushButton {{ background: {ACC}; color: #141414; border: none; "
+        f"border-radius: 5px; padding: 6px 14px; font-weight: 700; }}"
+        f"QPushButton:hover {{ background: {ACC_H}; }}"
+        f"QPushButton:pressed {{ background: #c07820; }}")
+    return b
+
+def btn_quiet(text):
+    b = QPushButton(text)
+    b.setCursor(Qt.PointingHandCursor)
+    b.setStyleSheet(
+        f"QPushButton {{ background: transparent; color: {DIM}; border: 1px solid {BDR_H}; "
+        f"border-radius: 5px; padding: 5px 12px; font-weight: 600; }}"
+        f"QPushButton:hover {{ color: {TEXT}; background: #272b2f; }}")
+    return b
+
+def btn_danger(text):
+    b = QPushButton(text)
+    b.setCursor(Qt.PointingHandCursor)
+    b.setStyleSheet(
+        f"QPushButton {{ background: transparent; color: {RED}; border: 1px solid {RED}; "
+        f"border-radius: 5px; padding: 5px 12px; font-weight: 600; }}"
+        f"QPushButton:hover {{ background: #2e1515; }}")
+    return b
+
+def btn_icon(text, tip="", size=26, fg=DIM):
     b = QPushButton(text)
     b.setFixedSize(size, size)
-    b.setToolTip(tooltip)
-    font_pt = max(7, size - 14)   # e.g. size=24 → 10pt, size=28 → 14pt
+    b.setToolTip(tip)
+    b.setCursor(Qt.PointingHandCursor)
     b.setStyleSheet(
-        f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
-        f"font-size: {font_pt}pt; padding: 0; margin: 0; }}"
-        f"QPushButton:hover {{ color: {TEXT}; background: {BTN}; border-radius: 5px; }}"
-    )
+        f"QPushButton {{ background: transparent; color: {fg}; border: none; "
+        f"font-size: {max(8, size - 15)}pt; padding: 0; }}"
+        f"QPushButton:hover {{ color: {TEXT}; background: #272b2f; border-radius: 5px; }}")
     return b
 
-def primary_btn(text):
-    b = QPushButton(text)
-    b.setStyleSheet(f"QPushButton {{ background: {ACCENT}; color: white; border: none; "
-                    f"border-radius: 7px; padding: 7px 16px; font-weight: 600; }}"
-                    f"QPushButton:hover {{ background: #7a72ff; }}"
-                    f"QPushButton:pressed {{ background: #5a53ee; }}")
-    return b
+def micro_label(text, color=DIM):
+    l = QLabel(text.upper())
+    f = l.font(); f.setPointSize(7); f.setBold(True); f.setLetterSpacing(QFont.AbsoluteSpacing, 1.4)
+    l.setFont(f)
+    l.setStyleSheet(f"color: {color}; background: transparent;")
+    return l
 
-def list_ck(checked=False):
-    """QCheckBox pre-styled transparent for coloured list row backgrounds."""
-    ck = QCheckBox(); ck.setChecked(checked)
-    ck.setStyleSheet(
-        f"QCheckBox {{ background: transparent; }}"
-        f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
-        f"border: 2px solid {BDR_H}; background: transparent; }}"
-        f"QCheckBox::indicator:checked {{ background: {DONE_CLR}; border-color: {DONE_CLR}; }}"
-    )
-    return ck
+def sep_line():
+    f = QFrame(); f.setFixedHeight(1)
+    f.setStyleSheet(f"background: {BDR}; border: none;")
+    return f
 
-def ghost_btn(text, color=DIM):
-    b = QPushButton(text)
-    b.setStyleSheet(f"QPushButton {{ background: transparent; color: {color}; border: 1px solid {color}44; "
-                    f"border-radius: 7px; padding: 5px 12px; }}"
-                    f"QPushButton:hover {{ background: {color}15; color: {TEXT}; }}")
-    return b
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Stage pill — colored label with popup stage selector
-# ═════════════════════════════════════════════════════════════════════════════
-class StagePill(QToolButton):
-    def __init__(self, task, data, refresh_cb):
+class StageChip(QToolButton):
+    """Coloured-dot stage chip with an instant dropdown to switch stage."""
+    changed = pyqtSignal()
+
+    def __init__(self, task, data):
         super().__init__()
-        self._task = task; self._data = data; self._refresh = refresh_cb
+        self._task, self._data = task, data
         self.setPopupMode(QToolButton.InstantPopup)
-        self._rebuild_menu()
-        self._update()
-
-    def _rebuild_menu(self):
+        self.setCursor(Qt.PointingHandCursor)
         m = QMenu(self)
-        for s in self._data.get("stages", DEFAULT_STAGES):
-            act = m.addAction(s["name"])
-            act.setData(s["id"])
-        m.triggered.connect(self._change)
+        for s in data.get("stages", []):
+            act = m.addAction(s["name"]); act.setData(s["id"])
+        m.triggered.connect(self._pick)
         self.setMenu(m)
+        self._paint()
 
-    def _change(self, action):
+    def _pick(self, action):
         self._task["stage"] = action.data()
-        save(self._data)
-        self._update()
-        self._refresh()
+        save_data(self._data)
+        self._paint()
+        self.changed.emit()
 
-    def _update(self):
-        sc = stage_color(self._data, self._task["stage"])
-        sn = stage_name(self._data, self._task["stage"])
-        self.setText(sn + " ▾")
+    def _paint(self):
+        s = stage_by_id(self._data, self._task.get("stage"))
+        self.setText(f"●  {s['name']}")
         self.setStyleSheet(
-            f"QToolButton {{ background: {sc}; color: #ffffff; border: none; "
-            f"border-radius: 8px; padding: 2px 10px; font-size: 7pt; font-weight: bold; }}"
-            f"QToolButton:hover {{ background: {sc}cc; }}"
-            f"QToolButton::menu-indicator {{ width: 0; }}"
-        )
+            f"QToolButton {{ background: {SURF2}; color: {TEXT}; border: 1px solid {BDR}; "
+            f"border-radius: 4px; padding: 2px 8px; font-size: 8pt; }}"
+            f"QToolButton:hover {{ border-color: {BDR_H}; }}"
+            f"QToolButton::menu-indicator {{ width: 0; }}")
+        # colour just the dot via rich text? QToolButton can't — tint whole text subtly instead
+        self.setStyleSheet(self.styleSheet().replace(
+            f"color: {TEXT};", f"color: {s['color']};"))
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Tile card
-# ═════════════════════════════════════════════════════════════════════════════
-class TileCard(QFrame):
-    def __init__(self, task, data, app, refresh_cb):
+
+class TinyProgress(QWidget):
+    def __init__(self, done, total):
         super().__init__()
-        self._task = task; self._data = data; self._app = app; self._refresh = refresh_cb
+        self.setFixedHeight(4)
+        self._pct = 0 if total == 0 else done / total
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, e):
+        from PyQt5.QtGui import QPainter, QBrush
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(BG)))
+        p.drawRoundedRect(0, 0, self.width(), 4, 2, 2)
+        if self._pct > 0:
+            p.setBrush(QBrush(QColor(GRN)))
+            p.drawRoundedRect(0, 0, int(self.width() * self._pct), 4, 2, 2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task card — drag source + drop target
+# ══════════════════════════════════════════════════════════════════════════════
+MIME = "application/x-tiledo-task"
+
+class TaskCard(QFrame):
+    open_requested = pyqtSignal(dict)
+    drop_action    = pyqtSignal(str, str, str)     # src_id, target_id, mode
+
+    def __init__(self, task, data, app, allow_nest=True):
+        super().__init__()
+        self._task, self._data, self._app = task, data, app
+        self._allow_nest = allow_nest
+        self._press_pos = None
+        self._dragging = False
+        self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
         self._build()
 
+    # ── content ──────────────────────────────────────────────────────────────
     def _build(self):
-        acc = TILE_ACC.get(self._task["priority"], BDR_H)
-        bg  = TILE_BG.get(self._task["priority"], BG3)
+        pc = PRIO_COLOR.get(self._task["priority"], DIM)
+        self.setObjectName("card")
         self.setStyleSheet(
-            f"TileCard {{ background: {bg}; border-radius: 12px; border: 1.5px solid {acc}70; }}"
-            f"TileCard:hover {{ border-color: {acc}cc; }}"
-        )
+            f"#card {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 8px; }}"
+            f"#card:hover {{ background: {SURF_H}; border-color: {BDR_H}; }}")
+
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
 
-        # Main content area — explicit bg so priority colour shows fully (not window bg)
-        content = QWidget()
-        content.setAttribute(Qt.WA_StyledBackground, True)
-        content.setStyleSheet(f"background: {bg};")
-        vlay = QVBoxLayout(content)
-        vlay.setContentsMargins(12, 10, 8, 10)
-        vlay.setSpacing(4)
+        stripe = QFrame(); stripe.setFixedWidth(3)
+        stripe.setStyleSheet(
+            f"background: {pc}; border-top-left-radius: 8px; "
+            f"border-bottom-left-radius: 8px; border: none;")
+        outer.addWidget(stripe)
 
-        # Top row: title + cog + checkbox
-        top = QHBoxLayout(); top.setSpacing(4)
-        title_lbl = QLabel(self._task["title"])
-        title_lbl.setWordWrap(True)
-        title_lbl.setStyleSheet(
-            f"color: #ffffff; font-size: 10pt; font-weight: 600; "
-            f"background: rgba(0,0,0,115); border-radius: 5px; padding: 3px 7px;"
-        )
-        title_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        body = QWidget(); body.setStyleSheet("background: transparent;")
+        v = QVBoxLayout(body); v.setContentsMargins(11, 9, 9, 9); v.setSpacing(5)
 
-        cog = icon_btn("⚙", "Edit / Notes", 22)
-        cog.clicked.connect(self._edit)
+        top = QHBoxLayout(); top.setSpacing(3)
+        title = QLabel(self._task["title"])
+        title.setWordWrap(True)
+        tf = title.font(); tf.setPointSize(10); tf.setBold(True); title.setFont(tf)
+        title.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        top.addWidget(title, 1)
+
+        menu_b = btn_icon("⋯", "Actions", 24)
+        menu_b.clicked.connect(self._menu)
+        top.addWidget(menu_b, 0, Qt.AlignTop)
 
         ck = QCheckBox()
         ck.setChecked(self._task.get("completed", False))
+        ck.setToolTip("Complete (includes subtasks)")
         ck.stateChanged.connect(self._complete)
-        ck.setStyleSheet(
-            f"QCheckBox {{ background: transparent; }}"
-            f"QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 9px; "
-            f"border: 2px solid {acc}88; background: transparent; }}"
-            f"QCheckBox::indicator:checked {{ background: {DONE_CLR}; border-color: {DONE_CLR}; }}"
-        )
+        top.addWidget(ck, 0, Qt.AlignTop)
+        v.addLayout(top)
 
-        top.addWidget(title_lbl)
-        top.addWidget(cog)
-        top.addWidget(ck)
-        vlay.addLayout(top)
-
-        # Subtask preview; fall back to notes if no subtasks
-        subs = [t for t in self._data["tasks"] if t.get("parent_id") == self._task["id"]]
-        pending_subs = [t for t in subs if not t.get("completed")]
-        _sub_ss = (
-            f"color: rgba(255,255,255,200); font-size: 8pt; "
-            f"background: rgba(0,0,0,75); border-radius: 4px; padding: 1px 6px;"
-        )
-        if pending_subs:
-            for t in pending_subs[:3]:
-                sl = QLabel(f"· {t['title']}")
-                sl.setStyleSheet(_sub_ss)
-                sl.setWordWrap(True)
-                vlay.addWidget(sl)
-            if len(pending_subs) > 3:
-                more = QLabel(f"· +{len(pending_subs)-3} more…")
-                more.setStyleSheet(_sub_ss.replace("8pt","7pt"))
-                vlay.addWidget(more)
+        kids = children_of(self._data, self._task["id"])
+        pend = [k for k in kids if not k.get("completed")]
+        if kids:
+            done = len(kids) - len(pend)
+            pr = QHBoxLayout(); pr.setSpacing(6)
+            bar = TinyProgress(done, len(kids))
+            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            pr.addWidget(bar, 1)
+            cnt = QLabel(f"{done}/{len(kids)}")
+            cnt.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
+            pr.addWidget(cnt)
+            v.addLayout(pr)
+            for k in pend[:2]:
+                s = stage_by_id(self._data, k.get("stage"))
+                lab = QLabel(f"·  {k['title']}")
+                lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
+                lab.setWordWrap(False)
+                v.addWidget(lab)
+            if len(pend) > 2:
+                more = QLabel(f"·  +{len(pend) - 2} more")
+                more.setStyleSheet(f"color: {FAINT}; font-size: 8pt; background: transparent;")
+                v.addWidget(more)
         else:
-            notes = self._task.get("notes", "").strip()
-            if notes:
-                preview = notes[:120] + ("…" if len(notes) > 120 else "")
-                nl = QLabel(preview)
-                nl.setWordWrap(True)
-                nl.setStyleSheet(_sub_ss)
-                vlay.addWidget(nl)
+            note = (self._task.get("notes") or "").strip().splitlines()
+            if note:
+                lab = QLabel(note[0][:90])
+                lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; font-style: italic; background: transparent;")
+                lab.setWordWrap(True)
+                v.addWidget(lab)
 
-        vlay.addStretch()
+        v.addStretch()
 
-        # Stage pill
-        pill = StagePill(self._task, self._data, self._refresh)
-        vlay.addWidget(pill, 0, Qt.AlignLeft)
+        bottom = QHBoxLayout(); bottom.setSpacing(5)
+        chip = StageChip(self._task, self._data)
+        chip.changed.connect(self._app.refresh)
+        bottom.addWidget(chip)
+        bottom.addStretch()
+        if kids:
+            kc = QLabel(f"⊞ {len(pend)}")
+            kc.setToolTip(f"{len(pend)} open subtasks")
+            kc.setStyleSheet(f"color: {FAINT}; font-size: 8pt; background: transparent;")
+            bottom.addWidget(kc)
+        v.addLayout(bottom)
+        outer.addWidget(body, 1)
 
-        outer.addWidget(content, 1)
+        # drop indicators (hidden until a drag hovers)
+        self._ind_l = QFrame(self); self._ind_r = QFrame(self)
+        for f in (self._ind_l, self._ind_r):
+            f.setStyleSheet(f"background: {ACC}; border-radius: 2px;")
+            f.hide()
 
-        # Right strip — top half: Skip ↓, bottom half: Replace ⇄
-        # No outer border, no divider line; buttons carry their own radius and background.
-        strip = QWidget()
-        strip.setFixedWidth(30)
-        strip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        strip.setStyleSheet("QWidget { background: transparent; }")
-        sl = QVBoxLayout(strip); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(0)
+    # ── interactions ─────────────────────────────────────────────────────────
+    def _complete(self, state):
+        cascade_complete(self._data, self._task["id"], bool(state))
+        save_data(self._data)
+        self._app.refresh()
 
-        sk = QPushButton("↓")
-        sk.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        sk.setToolTip("Skip — push to back of queue")
-        sk.setStyleSheet(
-            f"QPushButton {{ background: {acc}30; color: {acc}; border: none; "
-            f"border-top-right-radius: 12px; font-size: 13pt; padding: 0; margin: 0; }}"
-            f"QPushButton:hover {{ background: {acc}55; }}"
-        )
-        sk.clicked.connect(self._skip)
+    def _menu(self):
+        m = QMenu(self)
+        m.addAction("Open").triggered.connect(
+            lambda _=False: self.open_requested.emit(self._task))
+        m.addAction("Edit…").triggered.connect(self._edit)
+        m.addAction("Add subtask…").triggered.connect(self._add_sub)
+        m.addAction("Open in window").triggered.connect(
+            lambda _=False: self._app.open_task_window(self._task))
+        m.addSeparator()
+        m.addAction("Skip to back").triggered.connect(self._skip)
+        m.addAction("Swap with queued…").triggered.connect(self._swap)
+        m.addSeparator()
+        act = m.addAction("Delete")
+        act.triggered.connect(self._delete)
+        m.exec_(self.mapToGlobal(self.rect().center()))
 
-        rp = QPushButton("⇄")
-        rp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        rp.setToolTip("Replace — swap with another task of same priority")
-        rp.setStyleSheet(
-            f"QPushButton {{ background: {acc}18; color: {acc}; border: none; "
-            f"border-bottom-right-radius: 12px; font-size: 10pt; padding: 0; margin: 0; }}"
-            f"QPushButton:hover {{ background: {acc}40; }}"
-        )
-        rp.clicked.connect(self._replace)
+    def _edit(self):
+        TaskDetailDialog(self.window(), self._task, self._data, self._app).exec_()
 
-        sl.addWidget(sk); sl.addWidget(rp)
-        outer.addWidget(strip)
+    def _add_sub(self):
+        AddTaskDialog(self.window(), self._data, self._app,
+                      parent_id=self._task["id"]).exec_()
+
+    def _skip(self):
+        b = bucket(self._data, self._task.get("parent_id"),
+                   self._task["priority"], bool(self._task.get("recurring")))
+        mx = max((t.get("order", 0) for t in b), default=0)
+        self._task["order"] = mx + 10
+        save_data(self._data)
+        self._app.refresh()
+
+    def _swap(self):
+        SwapDialog(self.window(), self._task, self._data, self._app).exec_()
+
+    def _delete(self):
+        n = len(descendant_ids(self._data, self._task["id"]))
+        msg = f"Delete “{self._task['title']}”"
+        if n: msg += f" and its {n} subtask{'s' if n != 1 else ''}"
+        if ConfirmDialog(self.window(), msg + "?").exec_() == QDialog.Accepted:
+            cascade_delete(self._data, self._task["id"])
+            save_data(self._data)
+            self._app.refresh()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            dlg = SubtaskWindow(self.window(), self._task, self._data, self._app)
-            self._app._open_window(dlg)
+            self._press_pos = e.pos()
+            self._dragging = False
 
-    def _complete(self, state):
-        self._task["completed"] = bool(state)
-        save(self._data); self._refresh(); self._app.refresh()
+    def mouseMoveEvent(self, e):
+        if self._press_pos is None or self._dragging:
+            return
+        if (e.pos() - self._press_pos).manhattanLength() < 10:
+            return
+        self._dragging = True
+        drag = QDrag(self)
+        mime = QMimeData()
+        pref = "r" if self._task.get("recurring") else "t"
+        mime.setData(MIME, f"{pref}:{self._task['id']}".encode())
+        drag.setMimeData(mime)
+        pm = self.grab()
+        drag.setPixmap(pm.scaledToWidth(int(pm.width() * 0.85), Qt.SmoothTransformation))
+        drag.setHotSpot(QPoint(20, 20))
+        eff = QGraphicsOpacityEffect(self); eff.setOpacity(0.35)
+        self.setGraphicsEffect(eff)
+        drag.exec_(Qt.MoveAction)
+        self.setGraphicsEffect(None)
+        self._press_pos = None
 
-    def _skip(self):
-        p_id = self._task.get("parent_id")
-        peers = [t for t in self._data["tasks"]
-                 if t.get("parent_id") == p_id and not t.get("completed") and not t.get("recurring")]
-        mx = max((t.get("order", 0) for t in peers), default=0)
-        self._task["order"] = mx + 1
-        save(self._data); self._refresh()
+    def mouseReleaseEvent(self, e):
+        if (e.button() == Qt.LeftButton and self._press_pos is not None
+                and not self._dragging):
+            self.open_requested.emit(self._task)
+        self._press_pos = None
 
-    def _replace(self):
-        ReplaceDialog(self.window(), self._task, self._data, self._app, self._refresh).exec_()
+    # ── drop target ──────────────────────────────────────────────────────────
+    def _payload(self, e):
+        if not e.mimeData().hasFormat(MIME):
+            return None
+        raw = bytes(e.mimeData().data(MIME)).decode()
+        pref, _, tid = raw.partition(":")
+        if (pref == "r") != bool(self._task.get("recurring")):
+            return None                                    # recurring ↔ normal
+        if tid == self._task["id"]:
+            return None
+        if self._task["id"] in descendant_ids(self._data, tid):
+            return None                                    # would create a cycle
+        return tid
 
-    def _edit(self):
-        dlg = TaskDetailDialog(self.window(), self._task, self._data, self._app)
-        dlg.accepted_sig.connect(self._refresh)
-        dlg.exec_()
+    def dragEnterEvent(self, e):
+        if self._payload(e):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Tile grid — cached tiles, smooth live resize via reposition only
-# ═════════════════════════════════════════════════════════════════════════════
-class TileGrid(QWidget):
-    def __init__(self, data, cfg, app, parent_id=None):
+    def dragMoveEvent(self, e):
+        tid = self._payload(e)
+        if not tid:
+            e.ignore(); return
+        e.acceptProposedAction()
+        x, w = e.pos().x(), max(self.width(), 1)
+        zone = ("before" if x < w * 0.3 else
+                "after"  if x > w * 0.7 else
+                ("nest" if self._allow_nest else "after"))
+        self._show_zone(zone)
+
+    def dragLeaveEvent(self, e):
+        self._show_zone(None)
+
+    def dropEvent(self, e):
+        tid = self._payload(e)
+        self._show_zone(None)
+        if not tid:
+            e.ignore(); return
+        x, w = e.pos().x(), max(self.width(), 1)
+        zone = ("before" if x < w * 0.3 else
+                "after"  if x > w * 0.7 else
+                ("nest" if self._allow_nest else "after"))
+        e.acceptProposedAction()
+        self.drop_action.emit(tid, self._task["id"], zone)
+
+    def _show_zone(self, zone):
+        h = self.height()
+        self._ind_l.setGeometry(0, 4, 3, h - 8)
+        self._ind_r.setGeometry(self.width() - 3, 4, 3, h - 8)
+        self._ind_l.setVisible(zone == "before")
+        self._ind_r.setVisible(zone == "after")
+        if zone == "nest":
+            self.setStyleSheet(
+                f"#card {{ background: {SURF_H}; border: 1.5px solid {ACC}; border-radius: 8px; }}")
+        else:
+            self.setStyleSheet(
+                f"#card {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 8px; }}"
+                f"#card:hover {{ background: {SURF_H}; border-color: {BDR_H}; }}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Card grid — manual flow layout; "focus" (no scroll) or "flow" (scroll) modes
+# ══════════════════════════════════════════════════════════════════════════════
+class SectionHeader(QWidget):
+    """Priority section label; accepts drops → moves task into that priority."""
+    dropped = pyqtSignal(str, str)   # src_id, priority
+
+    def __init__(self, priority, text, data):
         super().__init__()
-        self._data = data; self._cfg = cfg; self._app = app; self._pid = parent_id
-        self._tiles: list = []   # cached TileCard widgets
-        self._empty_lbl = None
-        self.setStyleSheet(f"background: {BG2};")
-        QTimer.singleShot(50, self.rebuild)   # initial populate after layout is ready
+        self._prio, self._data = priority, data
+        self.setAcceptDrops(True)
+        lay = QHBoxLayout(self); lay.setContentsMargins(2, 0, 2, 0)
+        self._lab = micro_label(text, PRIO_COLOR.get(priority, DIM))
+        lay.addWidget(self._lab); lay.addStretch()
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(MIME):
+            raw = bytes(e.mimeData().data(MIME)).decode()
+            if raw.startswith("t:"):
+                e.acceptProposedAction()
+                self._lab.setStyleSheet(f"color: {TEXT}; background: transparent;")
+                return
+        e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._lab.setStyleSheet(f"color: {PRIO_COLOR.get(self._prio, DIM)}; background: transparent;")
+
+    def dropEvent(self, e):
+        raw = bytes(e.mimeData().data(MIME)).decode()
+        self.dropped.emit(raw.partition(":")[2], self._prio)
+        e.acceptProposedAction()
+
+
+class CardGrid(QScrollArea):
+    def __init__(self, app, data, cfg, mode="focus", parent_id=None, recurring=False):
+        super().__init__()
+        self._app, self._data, self._cfg = app, data, cfg
+        self.mode, self.parent_id, self.recurring = mode, parent_id, recurring
+        self._items = []          # (widget, kind) kind: card | header | label
+        self._queued_chip = None
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if mode == "flow" else Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._box = QWidget()
+        self._box.setStyleSheet("background: transparent;")
+        self.setWidget(self._box)
+        QTimer.singleShot(0, self.rebuild)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._reposition()       # instant — no timer, no widget creation
+        self._relayout()
 
+    # ── data → widgets ───────────────────────────────────────────────────────
     def rebuild(self):
-        """Call when underlying data changes. Recreates tile widgets, then repositions."""
-        for t in self._tiles: t.deleteLater()
-        self._tiles = []
-        if self._empty_lbl:
-            self._empty_lbl.deleteLater()
-            self._empty_lbl = None
+        for w, _ in self._items:
+            w.deleteLater()
+        self._items = []
+        if self._queued_chip:
+            self._queued_chip.deleteLater(); self._queued_chip = None
 
-        # Cache ALL pending tasks as TileCards (hidden until positioned)
-        tasks = display_tasks(self._data, self._pid, 9999)
-        for t in tasks:
-            tile = TileCard(t, self._data, self._app, self.rebuild)
-            tile.setParent(self)
-            tile.hide()
-            self._tiles.append(tile)
-
-        self._reposition()
-
-    def _reposition(self):
-        """Priority-grouped rows: each priority fills whole rows before the next starts."""
-        w = self.width(); h = self.height()
-        if w < 60: return
-
-        if not self._tiles:
-            if self._empty_lbl is None:
-                self._empty_lbl = QLabel("All caught up  ✓\nNo pending tasks", self)
-                self._empty_lbl.setAlignment(Qt.AlignCenter)
-                self._empty_lbl.setStyleSheet(
-                    f"color: {DIM}; font-size: 14pt; font-weight: 300; background: transparent;"
-                )
-            self._empty_lbl.setGeometry(0, 0, w, h)
-            self._empty_lbl.show()
-            return
-
-        margin = 10; gap = 10
-        ts   = self._cfg.get("tile_size", 220)
-        cols = max(1, (w - 2*margin + gap) // (ts + gap))
-        sz   = max(100, (w - 2*margin - gap*(cols - 1)) // cols)
-
-        # Split into "featured" (up to cols per priority) and "overflow" (the rest).
-        # Featured tiles fill rows in priority order, mixing priorities only when a
-        # group has fewer tiles than cols (e.g. 2 medium + 1 low share a row of 3).
-        # Overflow tiles are appended at the bottom in priority order.
-        hi = [t for t in self._tiles if t._task["priority"] == "high"]
-        me = [t for t in self._tiles if t._task["priority"] == "medium"]
-        lo = [t for t in self._tiles if t._task["priority"] == "low"]
-
-        featured = hi[:cols] + me[:cols] + lo[:cols]
-        overflow = hi[cols:]  + me[cols:]  + lo[cols:]
-        all_disp = featured + overflow
-
-        shown = set()
-        for i, tile in enumerate(all_disp):
-            r, c = divmod(i, cols)
-            x = margin + c * (sz + gap)
-            y = margin + r * (sz + gap)
-            if y + sz <= h:
-                tile.setGeometry(x, y, sz, sz)
-                tile.show()
-                shown.add(id(tile))
+        if self.recurring:
+            active = [t for t in self._data["tasks"]
+                      if t.get("recurring") and not t.get("completed")]
+            done = [t for t in self._data["tasks"]
+                    if t.get("recurring") and t.get("completed")]
+            active.sort(key=lambda t: t.get("order", 0))
+            if active or done:
+                self._add_header(None, f"Active · {len(active)}")
+                for t in active: self._add_card(t, allow_nest=False)
+                if done:
+                    self._add_header(None, f"Done · {len(done)}")
+                    for t in done: self._add_card(t, allow_nest=False)
             else:
-                tile.hide()
+                self._add_empty("No recurring tasks yet — add one above.")
+        elif self.mode == "focus":
+            any_items = False
+            for prio in ("high", "medium", "low"):
+                items = bucket(self._data, None, prio)
+                if not items: continue
+                any_items = True
+                self._add_header(prio, f"{PRIO_LABEL[prio]} · {len(items)}")
+                for t in items: self._add_card(t)
+            if not any_items:
+                self._add_empty("All clear ✓\nAdd a task above to get started.")
+        else:  # flow — children of parent_id
+            items = children_of(self._data, self.parent_id, include_done=False)
+            for t in items: self._add_card(t)
+            if not items:
+                self._add_empty("Nothing here yet — add items above,\nor drag cards in to group them.")
+        self._relayout()
 
-        for tile in self._tiles:
-            if id(tile) not in shown:
-                tile.hide()
+    def _add_card(self, t, allow_nest=True):
+        c = TaskCard(t, self._data, self._app, allow_nest=allow_nest and not self.recurring)
+        c.setParent(self._box)
+        c.open_requested.connect(self._app.open_task)
+        c.drop_action.connect(self._app.handle_drop)
+        c.hide()
+        self._items.append((c, "card"))
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Recurring view — active + done sections, drag to reorder
-# ═════════════════════════════════════════════════════════════════════════════
-class RecurringTile(QFrame):
-    drag_started = pyqtSignal(object)
+    def _add_header(self, prio, text):
+        if prio:
+            h = SectionHeader(prio, text, self._data)
+            h.dropped.connect(self._app.handle_priority_drop)
+        else:
+            h = QWidget(); lay = QHBoxLayout(h); lay.setContentsMargins(2, 0, 2, 0)
+            lay.addWidget(micro_label(text)); lay.addStretch()
+        h.setParent(self._box); h.hide()
+        self._items.append((h, "header"))
 
-    def __init__(self, task, data, app, refresh_cb):
-        super().__init__()
-        self._task = task; self._data = data; self._app = app; self._refresh = refresh_cb
-        self._drag_pos = None
-        acc = TILE_ACC.get(task["priority"], BDR_H)
-        bg  = TILE_BG.get(task["priority"], BG3)
-        self.setStyleSheet(f"RecurringTile {{ background: {bg}; border-radius: 10px; border: 1px solid {acc}40; }}"
-                           f"RecurringTile:hover {{ border-color: {acc}70; }}")
-        self._build(acc)
+    def _add_empty(self, text):
+        l = QLabel(text)
+        l.setAlignment(Qt.AlignCenter)
+        l.setStyleSheet(f"color: {FAINT}; font-size: 12pt; background: transparent;")
+        l.setParent(self._box); l.hide()
+        self._items.append((l, "empty"))
 
-    def _build(self, acc):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(6)
-        lay.setAlignment(Qt.AlignTop)
-
-        top = QHBoxLayout(); top.setSpacing(4)
-        tl = QLabel(self._task["title"])
-        tl.setStyleSheet(f"color: {TEXT}; font-weight: 600; font-size: 9pt; background: transparent;")
-        tl.setWordWrap(True)
-        ck = QCheckBox()
-        ck.setChecked(self._task.get("completed", False))
-        ck.stateChanged.connect(lambda s: self._toggle(s))
-        ck.setStyleSheet(
-            f"QCheckBox {{ background: transparent; }}"
-            f"QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 9px; "
-            f"border: 2px solid {acc}88; background: transparent; }}"
-            f"QCheckBox::indicator:checked {{ background: {DONE_CLR}; border-color: {DONE_CLR}; }}"
-        )
-        top.addWidget(tl, 1); top.addWidget(ck)
-        lay.addLayout(top)
-        pill = StagePill(self._task, self._data, self._refresh)
-        lay.addWidget(pill, 0, Qt.AlignLeft)
-        lay.addStretch()
-
-    def _toggle(self, state):
-        self._task["completed"] = bool(state)
-        save(self._data); self._refresh()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._drag_pos = e.pos()
-
-    def mouseMoveEvent(self, e):
-        if self._drag_pos and (e.pos() - self._drag_pos).manhattanLength() > 8:
-            self._drag_pos = None
-            self.drag_started.emit(self)
-
-    def mouseReleaseEvent(self, e):
-        self._drag_pos = None
-
-
-class RecurringView(QScrollArea):
-    def __init__(self, data, cfg, app):
-        super().__init__()
-        self._data = data; self._cfg = cfg; self._app = app
-        self._dragging_task = None
-        self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setStyleSheet(f"background: {BG2};")
-        self.rebuild()
-
-    def rebuild(self):
-        container = QWidget(); container.setStyleSheet(f"background: {BG2};")
-        lay = QVBoxLayout(container)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
-
-        ts = self._cfg.get("tile_size", 220)
-        w = max(self.width() - 30, ts)
-        cols = max(1, w // (ts + 10))
-        tile_sz = (w - 10 * (cols - 1)) // cols
-
-        active = [t for t in self._data["tasks"] if t.get("recurring") and not t.get("completed")]
-        done   = [t for t in self._data["tasks"] if t.get("recurring") and t.get("completed")]
-        active.sort(key=lambda t: t.get("order", 9999))
-
-        self._render_section(lay, "ACTIVE", active, tile_sz, cols, draggable=True)
-        if done:
-            sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-            sep.setStyleSheet(f"color: {BDR};"); lay.addWidget(sep)
-            self._render_section(lay, "DONE", done, tile_sz, cols, draggable=False)
-
-        lay.addStretch()
-        self.setWidget(container)
-
-    def _render_section(self, parent_lay, title, tasks, tile_sz, cols, draggable):
-        hdr = QLabel(title)
-        hdr.setStyleSheet(f"color: {DIM}; font-size: 7pt; font-weight: bold; letter-spacing: 2px;")
-        parent_lay.addWidget(hdr)
-        if not tasks:
-            empty = QLabel("  Nothing here")
-            empty.setStyleSheet(f"color: {DIM}; font-size: 8pt;")
-            parent_lay.addWidget(empty)
+    # ── widgets → geometry ───────────────────────────────────────────────────
+    def _relayout(self):
+        vw = self.viewport().width()
+        vh = self.viewport().height()
+        if vw < 80 or not self._items:
             return
-        grid = QGridLayout(); grid.setSpacing(10)
-        for i, t in enumerate(tasks):
-            r, c = divmod(i, cols)
-            tile = RecurringTile(t, self._data, self._app, self.rebuild)
-            tile.setFixedSize(tile_sz, tile_sz)
-            if draggable:
-                tile.drag_started.connect(self._on_drag_start)
-            grid.addWidget(tile, r, c)
-        for c in range(cols): grid.setColumnStretch(c, 1)
-        parent_lay.addLayout(grid)
+        m, g = 12, 10
+        base = max(150, self._cfg.get("tile_size", 230))
+        cols = max(1, (vw - 2 * m + g) // (base + g))
+        cw = (vw - 2 * m - g * (cols - 1)) // cols
+        ch = max(110, int(cw * 0.66))
 
-    def _on_drag_start(self, source_tile):
-        self._dragging_task = source_tile._task
-        self._source_tile = source_tile
-        source_tile.setStyleSheet(source_tile.styleSheet() + "opacity: 0.4;")
-        self.grabMouse()
-        self.installEventFilter(self)
+        y, col = m, 0
+        hidden = 0
+        limit_h = vh if self.mode == "focus" else 10 ** 9
 
-    def eventFilter(self, obj, event):
-        if self._dragging_task and event.type() == QEvent.MouseButtonRelease:
-            global_pos = event.globalPos()
-            target = self._find_tile_at(global_pos)
-            if target and target._task is not self._dragging_task:
-                src_order = self._dragging_task.get("order", 9999)
-                self._dragging_task["order"] = target._task.get("order", 9999)
-                target._task["order"] = src_order
-                # Renumber cleanly
-                active = [t for t in self._data["tasks"] if t.get("recurring") and not t.get("completed")]
-                active.sort(key=lambda t: t.get("order", 9999))
-                for i, t in enumerate(active): t["order"] = i
-                save(self._data)
-            self._dragging_task = None
-            self.releaseMouse()
-            self.removeEventFilter(self)
-            self.rebuild()
-            return True
-        return False
+        for w, kind in self._items:
+            if kind in ("header", "empty"):
+                if col > 0:
+                    y += ch + g; col = 0
+                if kind == "empty":
+                    w.setGeometry(0, 0, vw, max(vh, 120)); w.show()
+                    y = max(vh, 120)
+                    continue
+                if y + 20 > limit_h:
+                    w.hide(); continue
+                w.setGeometry(m, y, vw - 2 * m, 18); w.show()
+                y += 18 + 6
+            else:
+                x = m + col * (cw + g)
+                if y + ch > limit_h:
+                    w.hide(); hidden += 1; continue
+                w.setGeometry(x, y, cw, ch); w.show()
+                col += 1
+                if col >= cols:
+                    col = 0; y += ch + g
 
-    def _find_tile_at(self, global_pos):
-        widget = QApplication.widgetAt(global_pos)
-        while widget:
-            if isinstance(widget, RecurringTile): return widget
-            widget = widget.parent() if hasattr(widget, 'parent') else None
-        return None
+        total_h = y + (ch + g if col > 0 else 0) + m
+        self._box.setMinimumHeight(total_h if self.mode == "flow" else 0)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Image resize handle + custom text editor
-# ═════════════════════════════════════════════════════════════════════════════
-class _ImageHandle(QWidget):
-    """Draggable grip shown at the bottom-right of a clicked image."""
-    def __init__(self, viewport, editor, img_pos, img_w, img_tl):
-        super().__init__(viewport)
-        self._editor     = editor
-        self._img_pos    = img_pos
-        self._drag_start = None
-        self._start_w    = img_w
-        self.setFixedSize(14, 14)
-        self.setCursor(Qt.SizeFDiagCursor)
+        if self.mode == "focus" and hidden:
+            if self._queued_chip is None:
+                self._queued_chip = QLabel(self._box)
+                self._queued_chip.setStyleSheet(
+                    f"background: {SURF2}; color: {DIM}; border: 1px solid {BDR}; "
+                    f"border-radius: 9px; padding: 2px 10px; font-size: 8pt;")
+            self._queued_chip.setText(f"+{hidden} queued")
+            self._queued_chip.adjustSize()
+            self._queued_chip.move(vw - self._queued_chip.width() - 14,
+                                   vh - self._queued_chip.height() - 8)
+            self._queued_chip.show()
+        elif self._queued_chip:
+            self._queued_chip.hide()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Breadcrumb — navigation trail; crumbs accept drops (move task up the tree)
+# ══════════════════════════════════════════════════════════════════════════════
+class Crumb(QPushButton):
+    dropped = pyqtSignal(str, object)   # src_id, parent_id-or-None
+
+    def __init__(self, text, pid):
+        super().__init__(text)
+        self._pid = pid
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
-            f"background: {ACCENT}; border-radius: 3px; border: 1px solid white;"
-        )
-        # Place at estimated right edge of image
-        x = min(img_tl.x() + img_w - 7,  viewport.width()  - 14)
-        y = min(img_tl.y() + 60,          viewport.height() - 14)
-        self.move(max(0, x), max(0, y))
+            f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
+            f"padding: 3px 6px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {ACC}; }}")
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._drag_start = e.globalPos()
-            self._start_w    = self._cur_w()
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(MIME) and bytes(e.mimeData().data(MIME)).decode().startswith("t:"):
+            e.acceptProposedAction()
 
-    def mouseMoveEvent(self, e):
-        if self._drag_start:
-            dx    = e.globalPos().x() - self._drag_start.x()
-            new_w = max(40, self._start_w + dx)
-            self._apply(new_w)
-
-    def mouseReleaseEvent(self, e):
-        self._drag_start = None
-
-    def _cur_w(self):
-        c = QTextCursor(self._editor.document())
-        c.setPosition(self._img_pos)
-        fmt = c.charFormat()
-        try:
-            return int(fmt.toImageFormat().width()) or 400
-        except Exception:
-            return 400
-
-    def _apply(self, w):
-        doc = self._editor.document()
-        c = QTextCursor(doc)
-        c.setPosition(self._img_pos)
-        fmt = c.charFormat()
-        img_fmt = fmt.toImageFormat()
-        img_fmt.setWidth(w)
-        c.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-        c.mergeCharFormat(img_fmt)
-        # Slide handle to new right-edge position
-        vp = self.parent()
-        c2 = QTextCursor(doc); c2.setPosition(self._img_pos)
-        new_x = min(self._editor.cursorRect(c2).left() + w - 7, vp.width() - 14)
-        self.move(max(0, new_x), self.y())
+    def dropEvent(self, e):
+        raw = bytes(e.mimeData().data(MIME)).decode()
+        self.dropped.emit(raw.partition(":")[2], self._pid)
+        e.acceptProposedAction()
 
 
-class NotesEditor(QTextEdit):
-    """QTextEdit that shows a drag-to-resize handle when an image is clicked.
-    Uses a viewport event filter so mouse coords match cursorForPosition expectations."""
+class Breadcrumb(QWidget):
+    navigate = pyqtSignal(object)        # parent_id or None
+    move_to  = pyqtSignal(str, object)   # src_id, parent_id
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._img_handle = None
-        self.viewport().installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        if obj is not self.viewport():
-            return False
-        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            if self._img_handle:
-                self._img_handle.deleteLater()
-                self._img_handle = None
-            # Use U+FFFC (ObjectReplacementCharacter) detection — more reliable
-            # than isImageFormat() when images are inserted via insertHtml.
-            cursor = self.cursorForPosition(event.pos())
-            img_cur = self._find_image(cursor)
-            if img_cur is not None:
-                fmt    = img_cur.charFormat()
-                img_w  = 400
-                try: img_w = int(fmt.toImageFormat().width()) or 400
-                except Exception: pass
-                r = self.cursorRect(img_cur)
-                self._img_handle = _ImageHandle(
-                    self.viewport(), self, img_cur.position(),
-                    img_w, QPoint(r.left(), r.top()))
-                self._img_handle.show()
-        return False
-
-    def _find_image(self, cursor):
-        """Return a cursor positioned AT the image char, or None."""
-        doc = self.document()
-        pos = cursor.position()
-        for p in (pos, pos - 1):
-            if 0 <= p < doc.characterCount():
-                # U+FFFC is the ObjectReplacementCharacter Qt uses for inline images
-                if ord(doc.characterAt(p)) == 0xFFFC:
-                    c = QTextCursor(doc)
-                    c.setPosition(p)
-                    return c
-        return None
-
-    def scrollContentsBy(self, dx, dy):
-        super().scrollContentsBy(dx, dy)
-        if self._img_handle:
-            self._img_handle.deleteLater()
-            self._img_handle = None
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Notes view — multiple tabs, rich text, auto-save
-# ═════════════════════════════════════════════════════════════════════════════
-class NotesView(QWidget):
-    def __init__(self, data, app):
+    def __init__(self):
         super().__init__()
-        self._data = data; self._app = app
-        self._save_timer = QTimer(); self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self._autosave)
-        self._cur_tab_id = None
-        self._editors = {}       # tab_id -> QTextEdit
-        self._tab_btns = {}      # tab_id -> QPushButton
-        self.setStyleSheet(f"background: {BG2};")
-        self._build()
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0); self._lay.setSpacing(0)
 
-    def _build(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
+    def set_path(self, data, parent_id):
+        while self._lay.count():
+            it = self._lay.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        chain = []
+        if parent_id:
+            chain = ancestor_chain(data, parent_id) + [task_by_id(data, parent_id)]
+            chain = [c for c in chain if c]
+        crumbs = [("Tasks", None)] + [(t["title"], t["id"]) for t in chain]
+        for i, (label, pid) in enumerate(crumbs):
+            c = Crumb(label if len(label) < 30 else label[:28] + "…", pid)
+            c.clicked.connect(lambda _=False, p=pid: self.navigate.emit(p))
+            c.dropped.connect(self.move_to)
+            if i == len(crumbs) - 1:
+                c.setStyleSheet(c.styleSheet().replace(f"color: {DIM}", f"color: {TEXT}"))
+            self._lay.addWidget(c)
+            if i < len(crumbs) - 1:
+                s = QLabel("▸"); s.setStyleSheet(f"color: {FAINT}; background: transparent; padding: 0 1px;")
+                self._lay.addWidget(s)
+        self._lay.addStretch()
 
-        # ── Sub-tab bar (horizontally scrollable) ─────────────────────────
-        self._tab_scroll = QScrollArea()
-        self._tab_scroll.setFrameShape(QFrame.NoFrame)
-        self._tab_scroll.setFixedHeight(38)
-        self._tab_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._tab_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._tab_scroll.setWidgetResizable(False)
-        self._tab_scroll.setMinimumWidth(0)          # never force window wider
-        self._tab_scroll.setStyleSheet(f"""
-            QScrollArea {{ background: {BG}; border-bottom: 1px solid {BDR}; }}
-            QScrollBar:horizontal {{
-                background: {BG2}; height: 4px; border-radius: 2px; margin: 0; border: none;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: {BDR_H}; border-radius: 2px; min-width: 20px;
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
-        """)
-        self._tab_bar = QWidget()
-        self._tab_bar.setStyleSheet(f"background: {BG};")
-        self._tab_bar.setMinimumWidth(0)             # allow any window width
-        self._tbl = QHBoxLayout(self._tab_bar)
-        self._tbl.setContentsMargins(8, 4, 8, 4); self._tbl.setSpacing(2)
-        self._tbl.setSizeConstraint(QLayout.SetFixedSize)
-        self._tab_scroll.setWidget(self._tab_bar)
-        lay.addWidget(self._tab_scroll)
-
-        # ── Formatting toolbar ─────────────────────────────────────────────
-        tb = QWidget()
-        tb.setStyleSheet(f"background: {BG3}; border-bottom: 1px solid {BDR};")
-        tb_l = QHBoxLayout(tb); tb_l.setContentsMargins(8, 3, 8, 3); tb_l.setSpacing(2)
-        for text, tip, fn in [
-            ("H1","Heading 1", lambda: self._heading(1)),
-            ("H2","Heading 2", lambda: self._heading(2)),
-            ("H3","Heading 3", lambda: self._heading(3)),
-            ("B", "Bold",      self._bold),
-            ("I", "Italic",    self._italic),
-            ("•", "Bullet",    self._bullet),
-            ("🖼","Image",     self._insert_image),
-            ("Aa","Normal",    self._normal),
-        ]:
-            b = QPushButton(text); b.setFixedSize(38, 30); b.setToolTip(tip)
-            b.setStyleSheet(
-                f"QPushButton{{background:transparent;color:{DIM};border:none;"
-                f"font-size:11pt;padding:0;margin:0;}}"
-                f"QPushButton:hover{{background:{BTN_H};color:{TEXT};border-radius:5px;}}"
-            )
-            b.clicked.connect(fn); tb_l.addWidget(b)
-        tb_l.addStretch()
-        lay.addWidget(tb)
-
-        # ── Editor stack ───────────────────────────────────────────────────
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet(f"background: {BG3};")
-        lay.addWidget(self._stack, 1)
-
-        self._reload_tabs()
-
-    def _reload_tabs(self):
-        # Clear tab bar (keep + button logic below)
-        while self._tbl.count():
-            item = self._tbl.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        while self._stack.count():
-            w = self._stack.widget(0); self._stack.removeWidget(w); w.deleteLater()
-        self._editors.clear(); self._tab_btns.clear()
-
-        for tab in self._data.get("notes_tabs", []):
-            self._add_tab_ui(tab)
-
-        # + button — no border-radius in resting state to avoid glyph clipping
-        add = QPushButton("+"); add.setFixedSize(30, 28)
-        add.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{ACCENT};border:none;"
-            f"font-size:15pt;font-weight:bold;padding:0;margin:0;}}"
-            f"QPushButton:hover{{background:{BTN};border-radius:6px;}}")
-        add.clicked.connect(self._add_tab)
-        self._tbl.addWidget(add)
-        # No addStretch — tab bar is self-sizing, scroll area handles overflow
-
-        if self._data.get("notes_tabs"):
-            self._switch_tab(self._data["notes_tabs"][0]["id"])
-
-    def _add_tab_ui(self, tab):
-        tid = tab["id"]
-        row = QWidget(); row.setStyleSheet("background:transparent;")
-        rl = QHBoxLayout(row); rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
-
-        btn = QPushButton(tab["name"]); btn.setCheckable(True); btn.setFixedHeight(28)
-        btn.setStyleSheet(f"QPushButton{{background:transparent;color:{DIM};border:none;"
-                          f"border-radius:6px 0 0 6px;padding:3px 10px;font-size:9pt;}}"
-                          f"QPushButton:checked{{background:{BTN_H};color:{TEXT};}}"
-                          f"QPushButton:hover{{color:{TEXT};}}")
-        btn.clicked.connect(lambda _=False, t=tid: self._switch_tab(t))
-        btn.mouseDoubleClickEvent = lambda e, t=tid: self._rename_tab(t)
-
-        x = QPushButton("×"); x.setFixedSize(20, 28)
-        x.setStyleSheet(f"QPushButton{{background:transparent;color:{DIM};border:none;"
-                        f"border-radius:0 6px 6px 0;font-size:12pt;padding:0;}}"
-                        f"QPushButton:hover{{color:#ff6060;background:{BTN_H};}}")
-        x.clicked.connect(lambda _=False, t=tid: self._delete_tab(t))
-
-        rl.addWidget(btn); rl.addWidget(x)
-        self._tbl.addWidget(row)
-        self._tab_btns[tid] = btn
-
-        ed = NotesEditor(); ed.setAcceptRichText(True)
-        ed.setStyleSheet(f"QTextEdit{{background:{BG3};border:none;padding:14px;font-size:10pt;}}")
-        if tab.get("html"): ed.setHtml(tab["html"])
-        ed.textChanged.connect(lambda t=tid: self._on_change(t))
-        self._stack.addWidget(ed); self._editors[tid] = ed
-
-    def _switch_tab(self, tid):
-        self._autosave()
-        self._cur_tab_id = tid
-        for t, b in self._tab_btns.items(): b.setChecked(t == tid)
-        if tid in self._editors: self._stack.setCurrentWidget(self._editors[tid])
-
-    def _on_change(self, tid):
-        if tid == self._cur_tab_id: self._save_timer.start(600)
-
-    def _autosave(self):
-        if not self._cur_tab_id: return
-        ed = self._editors.get(self._cur_tab_id)
-        if ed:
-            for tab in self._data.get("notes_tabs", []):
-                if tab["id"] == self._cur_tab_id:
-                    tab["html"] = ed.toHtml(); break
-            save(self._data)
-
-    def _add_tab(self):
-        t = {"id": str(uuid.uuid4()), "name": "New Tab", "html": ""}
-        self._data["notes_tabs"].append(t); save(self._data)
-        self._reload_tabs(); self._switch_tab(t["id"])
-
-    def _rename_tab(self, tid):
-        cur = next((t["name"] for t in self._data["notes_tabs"] if t["id"] == tid), "")
-        name, ok = QInputDialog.getText(self, "Rename Tab", "Tab name:", text=cur)
-        if ok and name.strip():
-            for t in self._data["notes_tabs"]:
-                if t["id"] == tid: t["name"] = name.strip()
-            save(self._data)
-            if tid in self._tab_btns: self._tab_btns[tid].setText(name.strip())
-
-    def _delete_tab(self, tid):
-        if len(self._data.get("notes_tabs", [])) <= 1: return
-        self._autosave()
-        self._data["notes_tabs"] = [t for t in self._data["notes_tabs"] if t["id"] != tid]
-        save(self._data); self._reload_tabs()
-
-    def load_content(self): pass  # auto-loaded from data on build
-
-    def _ed(self): return self._editors.get(self._cur_tab_id)
-
-    def _heading(self, level):
-        ed = self._ed()
-        if not ed: return
-        cur = ed.textCursor(); fmt = QTextCharFormat()
-        fmt.setFontPointSize({1:20,2:16,3:13}[level]); fmt.setFontWeight(QFont.Bold)
-        cur.mergeCharFormat(fmt); ed.setTextCursor(cur)
-
-    def _bold(self):
-        ed = self._ed()
-        if not ed: return
-        cur = ed.textCursor(); fmt = QTextCharFormat()
-        fmt.setFontWeight(QFont.Normal if cur.charFormat().fontWeight() == QFont.Bold else QFont.Bold)
-        cur.mergeCharFormat(fmt); ed.setTextCursor(cur)
-
-    def _italic(self):
-        ed = self._ed()
-        if not ed: return
-        cur = ed.textCursor(); fmt = QTextCharFormat()
-        fmt.setFontItalic(not cur.charFormat().fontItalic())
-        cur.mergeCharFormat(fmt); ed.setTextCursor(cur)
-
-    def _bullet(self):
-        ed = self._ed()
-        if ed: ed.textCursor().insertList(QTextListFormat.ListDisc)
-
-    def _normal(self):
-        ed = self._ed()
-        if not ed: return
-        cur = ed.textCursor(); fmt = QTextCharFormat()
-        fmt.setFontPointSize(10); fmt.setFontWeight(QFont.Normal); fmt.setFontItalic(False)
-        cur.mergeCharFormat(fmt); ed.setTextCursor(cur)
-
-    def _insert_image(self):
-        ed = self._ed()
-        if not ed: return
-        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "",
-                                              "Images (*.png *.jpg *.jpeg *.gif *.bmp)")
-        if not path: return
-        with open(path, "rb") as f: img_b64 = base64.b64encode(f.read()).decode()
-        ext  = Path(path).suffix.lstrip(".").lower()
-        mime = "jpeg" if ext in ("jpg","jpeg") else ext
-        # Insert at a sensible default width; click the image to get a drag handle
-        ed.insertHtml(f'<img src="data:image/{mime};base64,{img_b64}" width="400"><br>')
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Drag bar + base dialog
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Frameless chrome: DragBar + BaseDialog
+# ══════════════════════════════════════════════════════════════════════════════
 class DragBar(QWidget):
-    def __init__(self, title, win, height=44, minimize=True):
-        super().__init__(); self._win = win; self._dp = None
+    def __init__(self, title, win, height=42, minimize=True):
+        super().__init__()
+        self._win, self._dp = win, None
         self.setFixedHeight(height)
-        lay = QHBoxLayout(self); lay.setContentsMargins(16, 0, 10, 0); lay.setSpacing(6)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 0, 8, 0); lay.setSpacing(6)
+        dot = QLabel("●"); dot.setStyleSheet(f"color: {ACC}; background: transparent; font-size: 8pt;")
+        lay.addWidget(dot)
         self._title = QLabel(title)
-        self._title.setStyleSheet(f"font-size: 11pt; font-weight: 600; color: {TEXT};")
-        lay.addWidget(self._title); lay.addStretch()
+        tf = self._title.font(); tf.setPointSize(10); tf.setBold(True)
+        self._title.setFont(tf)
+        self._title.setStyleSheet(f"color: {TEXT}; background: transparent; letter-spacing: 0.5px;")
+        lay.addWidget(self._title)
+        lay.addStretch()
         self._meta = QLabel("")
-        self._meta.setStyleSheet(f"color: {DIM}; font-size: 8pt;")
+        self._meta.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
         lay.addWidget(self._meta)
+        self.center_slot = lay   # dialogs can insert extra buttons
         if minimize:
-            mb = QPushButton("—"); mb.setFixedSize(32, 32)
-            mb.setStyleSheet(f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
-                             f"border-radius: 8px; font-size: 12pt; }}"
-                             f"QPushButton:hover {{ background: {BTN_H}; color: {TEXT}; }}")
-            mb.clicked.connect(win.showMinimized); lay.addWidget(mb)
-        cb = QPushButton("✕"); cb.setFixedSize(32, 32)
-        cb.setStyleSheet(f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
-                         f"border-radius: 8px; font-size: 12pt; }}"
-                         f"QPushButton:hover {{ background: #5a1818; color: #ff6060; }}")
-        cb.clicked.connect(win.close); lay.addWidget(cb)
-        self._lay = lay
+            mb = btn_icon("—", "Minimise", 30)
+            mb.clicked.connect(win.showMinimized)
+            lay.addWidget(mb)
+        cb = btn_icon("✕", "Close", 30)
+        cb.setStyleSheet(cb.styleSheet().replace("#272b2f", "#3a1515")
+                         .replace(f"color: {TEXT}", "color: #e07070"))
+        cb.clicked.connect(win.close)
+        lay.addWidget(cb)
 
     def set_meta(self, t): self._meta.setText(t)
     def set_title(self, t): self._title.setText(t)
+
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton: self._dp = e.globalPos() - self._win.frameGeometry().topLeft()
+        if e.button() == Qt.LeftButton:
+            self._dp = e.globalPos() - self._win.frameGeometry().topLeft()
+
     def mouseMoveEvent(self, e):
-        if e.buttons() == Qt.LeftButton and self._dp: self._win.move(e.globalPos() - self._dp)
+        if e.buttons() == Qt.LeftButton and self._dp:
+            self._win.move(e.globalPos() - self._dp)
+
     def mouseReleaseEvent(self, e): self._dp = None
+
     def mouseDoubleClickEvent(self, e):
-        self._win.showNormal() if self._win.isMaximized() else self._win.showMaximized()
+        if self._win.isMaximized(): self._win.showNormal()
+        else: self._win.showMaximized()
 
 
 class BaseDialog(QDialog):
@@ -978,590 +976,1401 @@ class BaseDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(w, h)
-        outer = QVBoxLayout(self); outer.setContentsMargins(10, 10, 10, 10); outer.setSpacing(0)
-        self.frame = QFrame(); self.frame.setObjectName("dlgFrame")
-        self.frame.setStyleSheet(f"#dlgFrame {{ background: {BG2}; border-radius: 12px; border: 1px solid {BDR}; }}")
-        sh = QGraphicsDropShadowEffect(self); sh.setBlurRadius(30)
-        sh.setColor(QColor(0,0,0,200)); sh.setOffset(0,5); self.frame.setGraphicsEffect(sh)
-        outer.addWidget(self.frame)
-        fl = QVBoxLayout(self.frame); fl.setContentsMargins(0,0,0,0); fl.setSpacing(0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        frame = QFrame(); frame.setObjectName("dlg")
+        frame.setStyleSheet(
+            f"#dlg {{ background: {BG}; border: 1px solid {BDR_H}; border-radius: 10px; }}")
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(28); sh.setColor(QColor(0, 0, 0, 190)); sh.setOffset(0, 4)
+        frame.setGraphicsEffect(sh)
+        outer.addWidget(frame)
+        fl = QVBoxLayout(frame); fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(0)
         self.bar = DragBar(title, self, 38, minimize=False)
-        self.bar.setStyleSheet(f"DragBar {{ background: {BG}; border-top-left-radius: 12px; "
-                               f"border-top-right-radius: 12px; border-bottom: 1px solid {BDR}; }}")
+        self.bar.setStyleSheet(
+            f"DragBar {{ background: {NAV}; border-top-left-radius: 10px; "
+            f"border-top-right-radius: 10px; border-bottom: 1px solid {BDR}; }}")
         fl.addWidget(self.bar)
-        self.body = QWidget(); self.body.setStyleSheet(f"background: {BG2};")
-        self._bl = QVBoxLayout(self.body); self._bl.setContentsMargins(20,16,20,20); self._bl.setSpacing(10)
+        self.body = QWidget(); self.body.setStyleSheet("background: transparent;")
+        self._bl = QVBoxLayout(self.body)
+        self._bl.setContentsMargins(18, 14, 18, 16); self._bl.setSpacing(9)
         fl.addWidget(self.body, 1)
 
     def add(self, w): self._bl.addWidget(w)
     def add_lay(self, l): self._bl.addLayout(l)
     def add_stretch(self): self._bl.addStretch()
 
-    def field_label(self, text):
-        l = QLabel(text); l.setStyleSheet(f"color: {DIM}; font-size: 8pt; font-weight: bold;")
-        return l
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Add task dialog
-# ═════════════════════════════════════════════════════════════════════════════
+class ConfirmDialog(BaseDialog):
+    def __init__(self, parent, text, ok_label="Delete"):
+        super().__init__(parent, "Confirm", 400, 170)
+        lab = QLabel(text); lab.setWordWrap(True)
+        self.add(lab); self.add_stretch()
+        row = QHBoxLayout()
+        ok = btn_danger(ok_label); ok.clicked.connect(self.accept)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        row.addStretch(); row.addWidget(no); row.addWidget(ok)
+        self.add_lay(row)
+
+
+class TextPromptDialog(BaseDialog):
+    def __init__(self, parent, title, label, initial=""):
+        super().__init__(parent, title, 400, 170)
+        self.add(micro_label(label))
+        self._edit = QLineEdit(initial)
+        self._edit.returnPressed.connect(self.accept)
+        self.add(self._edit); self.add_stretch()
+        row = QHBoxLayout()
+        ok = btn_primary("OK"); ok.clicked.connect(self.accept)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        row.addStretch(); row.addWidget(no); row.addWidget(ok)
+        self.add_lay(row)
+        self._edit.setFocus(); self._edit.selectAll()
+
+    def value(self): return self._edit.text().strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Add / edit task dialogs
+# ══════════════════════════════════════════════════════════════════════════════
+def _prio_row(selected="medium"):
+    lay = QHBoxLayout(); lay.setSpacing(10)
+    grp = QButtonGroup()
+    for p in ("high", "medium", "low"):
+        rb = QRadioButton(PRIO_LABEL[p])
+        rb.setProperty("v", p)
+        rb.setStyleSheet(f"color: {PRIO_COLOR[p]}; font-weight: 600; background: transparent;")
+        rb.setChecked(p == selected)
+        grp.addButton(rb); lay.addWidget(rb)
+    lay.addStretch()
+    return lay, grp
+
+
 class AddTaskDialog(BaseDialog):
     def __init__(self, parent, data, app, parent_id=None, recurring=False):
-        t = "Add Recurring" if recurring else ("Add Subtask" if parent_id else "Add Task")
-        super().__init__(parent, t, 460, 400)
-        self._data = data; self._app = app; self._pid = parent_id; self._rec = recurring
-        self._build()
-
-    def _build(self):
-        self.add(self.field_label("TITLE"))
-        self._title = QLineEdit(); self._title.setPlaceholderText("Task title…")
-        self._title.returnPressed.connect(self._save); self.add(self._title)
-
-        pr = QHBoxLayout(); pr.addWidget(QLabel("Priority:"))
-        self._pgrp = QButtonGroup(self)
-        for p in ("high", "medium", "low"):
-            rb = QRadioButton(PL[p]); rb.setProperty("v", p)
-            rb.setStyleSheet(f"color: {TILE_ACC[p]}; font-weight: bold;")
-            if p == "medium": rb.setChecked(True)
-            self._pgrp.addButton(rb); pr.addWidget(rb)
-        pr.addStretch(); self.add_lay(pr)
-
-        if not self._rec:
-            sr = QHBoxLayout(); sr.addWidget(QLabel("Stage:"))
+        t = "Add recurring task" if recurring else ("Add subtask" if parent_id else "Add task")
+        super().__init__(parent, t, 440, 360)
+        self._data, self._app = data, app
+        self._pid, self._rec = parent_id, recurring
+        self.add(micro_label("Title"))
+        self._title = QLineEdit(); self._title.setPlaceholderText("What needs doing?")
+        self._title.returnPressed.connect(self._save)
+        self.add(self._title)
+        self.add(micro_label("Priority"))
+        pl, self._grp = _prio_row(); self.add_lay(pl)
+        if not recurring:
+            self.add(micro_label("Stage"))
             self._stage = QComboBox()
-            for s in self._data.get("stages", DEFAULT_STAGES): self._stage.addItem(s["name"], s["id"])
-            sr.addWidget(self._stage); sr.addStretch(); self.add_lay(sr)
-        else: self._stage = None
-
-        self.add(self.field_label("NOTES (OPTIONAL)"))
-        self._notes = QTextEdit(); self._notes.setFixedHeight(70)
+            for s in data.get("stages", []): self._stage.addItem(s["name"], s["id"])
+            self.add(self._stage)
+        else:
+            self._stage = None
+        self.add(micro_label("Notes (optional)"))
+        self._notes = QTextEdit(); self._notes.setFixedHeight(64)
         self.add(self._notes); self.add_stretch()
-
-        br = QHBoxLayout()
-        sb = primary_btn("Add Task"); sb.clicked.connect(self._save)
-        cb = ghost_btn("Cancel"); cb.clicked.connect(self.reject)
-        br.addWidget(sb); br.addStretch(); br.addWidget(cb); self.add_lay(br)
+        row = QHBoxLayout()
+        ok = btn_primary("Add"); ok.clicked.connect(self._save)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        row.addStretch(); row.addWidget(no); row.addWidget(ok)
+        self.add_lay(row)
         self._title.setFocus()
 
     def _save(self):
         title = self._title.text().strip()
         if not title: return
-        checked = self._pgrp.checkedButton()
-        t = mk_task(title, checked.property("v") if checked else "medium", self._pid, self._rec)
+        ch = self._grp.checkedButton()
+        t = mk_task(title, ch.property("v") if ch else "medium", self._pid, self._rec)
         if self._stage: t["stage"] = self._stage.currentData()
         t["notes"] = self._notes.toPlainText()
+        b = bucket(self._data, self._pid, t["priority"], self._rec)
+        t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
         self._data["tasks"].append(t)
-        save(self._data); self._app.refresh(); self.accept()
+        save_data(self._data)
+        self._app.refresh()
+        self.accept()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Task detail dialog
-# ═════════════════════════════════════════════════════════════════════════════
+
 class TaskDetailDialog(BaseDialog):
-    accepted_sig = pyqtSignal()
-
     def __init__(self, parent, task, data, app):
-        super().__init__(parent, "Edit Task", 480, 540)
-        self._task = task; self._data = data; self._app = app; self._build()
-
-    def _build(self):
-        self.add(self.field_label("TITLE"))
-        self._te = QLineEdit(self._task["title"]); self.add(self._te)
-
-        pr = QHBoxLayout(); pr.addWidget(QLabel("Priority:"))
-        self._pgrp = QButtonGroup(self)
-        for p in ("high", "medium", "low"):
-            rb = QRadioButton(PL[p]); rb.setProperty("v", p)
-            rb.setStyleSheet(f"color: {TILE_ACC[p]}; font-weight: bold;")
-            if self._task["priority"] == p: rb.setChecked(True)
-            self._pgrp.addButton(rb); pr.addWidget(rb)
-        pr.addStretch(); self.add_lay(pr)
-
-        sr = QHBoxLayout(); sr.addWidget(QLabel("Stage:"))
+        super().__init__(parent, "Edit task", 460, 470)
+        self._task, self._data, self._app = task, data, app
+        self.add(micro_label("Title"))
+        self._title = QLineEdit(task["title"])
+        self.add(self._title)
+        self.add(micro_label("Priority"))
+        pl, self._grp = _prio_row(task["priority"]); self.add_lay(pl)
+        self.add(micro_label("Stage"))
         self._stage = QComboBox()
-        for s in self._data.get("stages", DEFAULT_STAGES):
+        for s in data.get("stages", []):
             self._stage.addItem(s["name"], s["id"])
-            if s["id"] == self._task["stage"]: self._stage.setCurrentIndex(self._stage.count()-1)
-        sr.addWidget(self._stage); sr.addStretch(); self.add_lay(sr)
-
-        self.add(self.field_label("NOTES"))
-        self._notes = QTextEdit(self._task.get("notes",""))
-        self._notes.setMinimumHeight(120); self.add(self._notes); self.add_stretch()
-
-        br = QHBoxLayout()
-        sv = primary_btn("Save"); sv.clicked.connect(self._save)
-        dl = ghost_btn("Delete", "#ff607a"); dl.clicked.connect(self._delete)
-        cl = ghost_btn("Cancel"); cl.clicked.connect(self.reject)
-        br.addWidget(sv); br.addWidget(dl); br.addStretch(); br.addWidget(cl); self.add_lay(br)
-        self._te.setFocus()
+            if s["id"] == task.get("stage"):
+                self._stage.setCurrentIndex(self._stage.count() - 1)
+        self.add(self._stage)
+        self.add(micro_label("Notes"))
+        self._notes = QTextEdit(task.get("notes", ""))
+        self._notes.setMinimumHeight(110)
+        self.add(self._notes)
+        row = QHBoxLayout()
+        de = btn_danger("Delete"); de.clicked.connect(self._delete)
+        ok = btn_primary("Save"); ok.clicked.connect(self._save)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        row.addWidget(de); row.addStretch(); row.addWidget(no); row.addWidget(ok)
+        self.add_lay(row)
+        self._title.setFocus()
 
     def _save(self):
-        t = self._title_val() or self._task["title"]
-        self._task["title"] = t
-        checked = self._pgrp.checkedButton()
-        if checked: self._task["priority"] = checked.property("v")
+        t = self._title.text().strip()
+        if t: self._task["title"] = t
+        ch = self._grp.checkedButton()
+        if ch: self._task["priority"] = ch.property("v")
         self._task["stage"] = self._stage.currentData()
         self._task["notes"] = self._notes.toPlainText()
-        save(self._data); self._app.refresh(); self.accepted_sig.emit(); self.accept()
-
-    def _title_val(self): return self._te.text().strip()
+        save_data(self._data)
+        self._app.refresh()
+        self.accept()
 
     def _delete(self):
-        box = QMessageBox(self)
-        box.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        box.setStyleSheet(f"background:{BG2}; color:{TEXT};")
-        box.setText(f"Delete  '{self._task['title']}'?")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        if box.exec_() == QMessageBox.Yes:
-            self._data["tasks"] = [x for x in self._data["tasks"] if x["id"] != self._task["id"]]
-            save(self._data); self._app.refresh(); self.accepted_sig.emit(); self.accept()
+        n = len(descendant_ids(self._data, self._task["id"]))
+        msg = f"Delete “{self._task['title']}”"
+        if n: msg += f" and its {n} subtask{'s' if n != 1 else ''}"
+        if ConfirmDialog(self, msg + "?").exec_() == QDialog.Accepted:
+            cascade_delete(self._data, self._task["id"])
+            save_data(self._data)
+            self._app.refresh()
+            self.accept()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Full list dialog
-# ═════════════════════════════════════════════════════════════════════════════
-class FullListDialog(BaseDialog):
+
+class SwapDialog(BaseDialog):
+    """Swap this card's queue position with another pending task of the same priority."""
+    def __init__(self, parent, cur, data, app):
+        super().__init__(parent, "Swap with queued task", 520, 480)
+        self._cur, self._data, self._app = cur, data, app
+        hint = QLabel("Pick a task to trade places with — it takes this card's slot.")
+        hint.setWordWrap(True); hint.setStyleSheet(f"color: {DIM};")
+        self.add(hint)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+        box = QWidget(); box.setStyleSheet("background: transparent;")
+        v = QVBoxLayout(box); v.setContentsMargins(0, 4, 0, 4); v.setSpacing(4)
+        peers = [t for t in bucket(data, cur.get("parent_id"), cur["priority"],
+                                   bool(cur.get("recurring")))
+                 if t["id"] != cur["id"]]
+        if not peers:
+            v.addWidget(QLabel("No other tasks at this priority."))
+        for t in peers:
+            row = QFrame()
+            row.setStyleSheet(f"QFrame {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 6px; }}"
+                              f"QFrame:hover {{ border-color: {BDR_H}; }}")
+            rl = QHBoxLayout(row); rl.setContentsMargins(9, 5, 6, 5)
+            lab = QLabel(t["title"]); lab.setStyleSheet("background: transparent;")
+            rl.addWidget(lab, 1)
+            pick = btn_quiet("Swap")
+            pick.clicked.connect(lambda _=False, other=t: self._do(other))
+            rl.addWidget(pick)
+            v.addWidget(row)
+        v.addStretch()
+        sc.setWidget(box)
+        self.add(sc)
+        c = btn_quiet("Cancel"); c.clicked.connect(self.reject)
+        r = QHBoxLayout(); r.addStretch(); r.addWidget(c)
+        self.add_lay(r)
+
+    def _do(self, other):
+        self._cur["order"], other["order"] = other.get("order", 0), self._cur.get("order", 0)
+        save_data(self._data)
+        self._app.refresh()
+        self.accept()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# All-tasks tree overview
+# ══════════════════════════════════════════════════════════════════════════════
+class AllTasksDialog(BaseDialog):
     def __init__(self, parent, data, app):
-        super().__init__(parent, "All Tasks", 700, 640)
-        self._data = data; self._app = app; self._build()
-
-    def _build(self):
-        ab = primary_btn("+ Add Task"); ab.clicked.connect(self._add)
-        self.bar._lay.insertWidget(self.bar._lay.count()-1, ab)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
-        self.add(scroll)
-        self._lw = QWidget(); self._lw.setStyleSheet(f"background:{BG2};")
-        self._ll = QVBoxLayout(self._lw); self._ll.setContentsMargins(0,0,0,0); self._ll.setSpacing(3)
-        scroll.setWidget(self._lw); self._render()
+        super().__init__(parent, "All tasks", 640, 640)
+        self._data, self._app = data, app
+        clear = btn_quiet("Clear completed")
+        clear.clicked.connect(self._clear_done)
+        self.bar.center_slot.insertWidget(self.bar.center_slot.count() - 1, clear)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+        self._box = QWidget(); self._box.setStyleSheet("background: transparent;")
+        self._v = QVBoxLayout(self._box)
+        self._v.setContentsMargins(0, 2, 0, 2); self._v.setSpacing(3)
+        sc.setWidget(self._box)
+        self.add(sc)
+        self._render()
 
     def _render(self):
-        while self._ll.count():
-            item = self._ll.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        for prio, hdr in [("high","HIGH PRIORITY"),("medium","MEDIUM PRIORITY"),("low","LOW PRIORITY")]:
-            ts = [t for t in self._data["tasks"] if t["priority"]==prio and not t.get("recurring") and not t.get("parent_id")]
-            ts.sort(key=lambda t:(t.get("completed",False), t.get("order",9999)))
-            if not ts: continue
-            hl = QLabel(f"  {hdr}"); hl.setStyleSheet(
-                f"color:{TILE_ACC[prio]}; font-size:7pt; font-weight:bold; letter-spacing:2px; "
-                f"background:{BG}; padding:8px 4px 6px;")
-            self._ll.addWidget(hl)
-            for t in ts: self._ll.addWidget(self._make_row(t))
-        self._ll.addStretch()
+        while self._v.count():
+            it = self._v.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
 
-    def _make_row(self, t):
-        sc = stage_color(self._data, t["stage"])
-        row = QFrame(); row.setStyleSheet(f"QFrame{{background:{TILE_BG.get(t['priority'],BG3)};border-radius:7px;}}")
-        lay = QHBoxLayout(row); lay.setContentsMargins(6,3,6,3); lay.setSpacing(8)
-        acc_bar = QFrame(); acc_bar.setFixedSize(3,26)
-        acc_bar.setStyleSheet(f"background:{sc};border-radius:2px;border:none;"); lay.addWidget(acc_bar)
-        ck = list_ck(t.get("completed", False))
-        def tog(s, task=t): task["completed"]=bool(s); save(self._data); self._app.refresh(); self._app.update_meta(); self._render()
-        ck.stateChanged.connect(tog); lay.addWidget(ck)
-        tl = QLabel(t["title"]); done_s = "text-decoration:line-through;" if t.get("completed") else ""
-        tl.setStyleSheet(f"color:{DIM if t.get('completed') else TEXT};{done_s}background:transparent;")
-        tl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); lay.addWidget(tl)
-        eb = ghost_btn("Edit", DIM)
-        def do_edit(task=t):
+        def emit_rows(pid, level):
+            for t in children_of(self._data, pid):
+                self._v.addWidget(self._row(t, level))
+                emit_rows(t["id"], level + 1)
+
+        roots = children_of(self._data, None)
+        if roots:
+            self._v.addWidget(micro_label("Tasks"))
+            emit_rows(None, 0)
+        rec = [t for t in self._data["tasks"] if t.get("recurring")]
+        if rec:
+            self._v.addWidget(micro_label("Recurring"))
+            for t in sorted(rec, key=lambda x: (x.get("completed", False), x.get("order", 0))):
+                self._v.addWidget(self._row(t, 0))
+        if not roots and not rec:
+            e = QLabel("Nothing yet."); e.setStyleSheet(f"color: {FAINT};")
+            self._v.addWidget(e)
+        self._v.addStretch()
+
+    def _row(self, t, level):
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 6px; }}"
+            f"QFrame:hover {{ border-color: {BDR_H}; }}")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8 + level * 20, 4, 8, 4); rl.setSpacing(8)
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {PRIO_COLOR.get(t['priority'], DIM)}; "
+                          f"font-size: 7pt; background: transparent;")
+        rl.addWidget(dot)
+        ck = QCheckBox(); ck.setChecked(t.get("completed", False))
+
+        def tog(state, task=t):
+            cascade_complete(self._data, task["id"], bool(state))
+            save_data(self._data)
+            self._app.refresh()
+            self._render()
+        ck.stateChanged.connect(tog)
+        rl.addWidget(ck)
+        lab = QLabel(t["title"])
+        style = f"color: {DIM if t.get('completed') else TEXT}; background: transparent;"
+        if t.get("completed"): style += " text-decoration: line-through;"
+        lab.setStyleSheet(style)
+        lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        rl.addWidget(lab)
+        ed = btn_icon("✎", "Edit", 24)
+
+        def do_edit(_=False, task=t):
             dlg = TaskDetailDialog(self, task, self._data, self._app)
-            dlg.accepted_sig.connect(self._render); dlg.exec_()
-        eb.clicked.connect(lambda _checked, f=do_edit: f()); lay.addWidget(eb)
+            dlg.exec_()
+            self._render()
+        ed.clicked.connect(do_edit)
+        rl.addWidget(ed)
         return row
 
-    def _add(self):
-        dlg = AddTaskDialog(self, self._data, self._app)
-        dlg.accepted.connect(self._render); dlg.exec_()
+    def _clear_done(self):
+        done_roots = [t for t in self._data["tasks"]
+                      if t.get("completed") and not t.get("recurring")
+                      and t.get("parent_id") is None]
+        if not done_roots:
+            return
+        if ConfirmDialog(self, f"Remove {len(done_roots)} completed task(s) "
+                               f"and their subtasks?").exec_() == QDialog.Accepted:
+            for t in done_roots:
+                cascade_delete(self._data, t["id"])
+            save_data(self._data)
+            self._app.refresh()
+            self._render()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Subtask windows
-# ═════════════════════════════════════════════════════════════════════════════
-class SubtaskWindow(BaseDialog):
-    def __init__(self, parent, ptask, data, app):
-        super().__init__(parent, f"⊞  {ptask['title'][:42]}", 860, 600)
-        self._ptask = ptask; self._data = data; self._app = app
-        self._cfg = load_cfg(); self._build()
-
-    def _build(self):
-        ab = primary_btn("+ Add Subtask"); ab.clicked.connect(self._add)
-        lb = ghost_btn("☰ All Subtasks"); lb.clicked.connect(self._list)
-        self.bar._lay.insertWidget(self.bar._lay.count()-1, lb)
-        self.bar._lay.insertWidget(self.bar._lay.count()-1, ab)
-        self._grid = TileGrid(self._data, self._cfg, self._app, self._ptask["id"])
+# ══════════════════════════════════════════════════════════════════════════════
+# Pop-out task window (non-modal, tracked, own drill navigation)
+# ══════════════════════════════════════════════════════════════════════════════
+class TaskWindow(BaseDialog):
+    def __init__(self, parent, task, data, cfg, app):
+        super().__init__(parent, task["title"][:46], 760, 540)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)   # independent window
+        self._data, self._cfg, self._app = data, cfg, app
+        self._root = task["id"]
+        self._pid = task["id"]
+        back = btn_icon("←", "Back", 26)
+        back.clicked.connect(self._back)
+        self.bar.center_slot.insertWidget(2, back)
+        self._quick = QLineEdit()
+        self._quick.setPlaceholderText("＋  Add item…  (Enter)")
+        self._quick.returnPressed.connect(self._quick_add)
+        self.add(self._quick)
+        self._grid = CardGrid(self._winproxy(), data, cfg, mode="flow", parent_id=self._pid)
         self.add(self._grid)
 
-    def _add(self):
-        dlg = AddTaskDialog(self, self._data, self._app, self._ptask["id"])
-        dlg.accepted.connect(self._refresh); dlg.exec_()
+    def _winproxy(self):
+        """The grid talks to an app-like object; reroute open() into this window."""
+        outer = self
+        class Proxy:
+            def refresh(self): outer._app.refresh()
+            def open_task(self, task): outer._open(task)
+            def handle_drop(self, s, t, m): outer._app.handle_drop(s, t, m)
+            def handle_priority_drop(self, s, p): outer._app.handle_priority_drop(s, p)
+            def open_task_window(self, task): outer._app.open_task_window(task)
+        return Proxy()
 
-    def _list(self):
-        dlg = SubtaskListDialog(self, self._ptask, self._data, self._app)
-        self._app._open_window(dlg)
+    def _open(self, task):
+        self._pid = task["id"]
+        self._grid.parent_id = task["id"]
+        self.bar.set_title(task["title"][:46])
+        self._grid.rebuild()
 
-    def _refresh(self): self._grid.rebuild()
+    def _back(self):
+        t = task_by_id(self._data, self._pid)
+        up = t.get("parent_id") if t else None
+        if self._pid == self._root or up is None and self._pid == self._root:
+            return
+        self._pid = up if up is not None else self._root
+        pt = task_by_id(self._data, self._pid)
+        self.bar.set_title((pt["title"] if pt else "Tasks")[:46])
+        self._grid.parent_id = self._pid
+        self._grid.rebuild()
 
-    def _render(self): self._grid.rebuild()  # called by app.refresh()
-
-
-class SubtaskListDialog(BaseDialog):
-    def __init__(self, parent, ptask, data, app):
-        super().__init__(parent, f"Subtasks: {ptask['title'][:35]}", 620, 500)
-        self._ptask = ptask; self._data = data; self._app = app; self._build()
-
-    def _build(self):
-        ab = primary_btn("+ Add"); ab.clicked.connect(self._add)
-        self.bar._lay.insertWidget(self.bar._lay.count()-1, ab)
-        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
-        self.add(sc)
-        self._lw = QWidget(); self._lw.setStyleSheet(f"background:{BG2};")
-        self._ll = QVBoxLayout(self._lw); self._ll.setContentsMargins(0,0,0,0); self._ll.setSpacing(3)
-        sc.setWidget(self._lw); self._render()
+    def _quick_add(self):
+        title = self._quick.text().strip()
+        if not title: return
+        t = mk_task(title, "medium", self._pid)
+        b = bucket(self._data, self._pid, "medium")
+        t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
+        self._data["tasks"].append(t)
+        save_data(self._data)
+        self._quick.clear()
+        self._app.refresh()
 
     def _render(self):
-        while self._ll.count():
-            item = self._ll.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        subs = [t for t in self._data["tasks"] if t.get("parent_id")==self._ptask["id"]]
-        subs.sort(key=lambda t:(t.get("completed",False),{"high":0,"medium":1,"low":2}.get(t["priority"],2)))
-        for t in subs:
-            sc = stage_color(self._data, t["stage"])
-            row = QFrame(); row.setStyleSheet(f"QFrame{{background:{TILE_BG.get(t['priority'],BG3)};border-radius:7px;}}")
-            lay = QHBoxLayout(row); lay.setContentsMargins(6,3,6,3); lay.setSpacing(8)
-            ck = list_ck(t.get("completed", False))
-            def tog(s, task=t):
-                task["completed"] = bool(s); save(self._data)
-                self._app.refresh(); self._render()
-            ck.stateChanged.connect(tog); lay.addWidget(ck)
-            tl = QLabel(t["title"]); done_s="text-decoration:line-through;" if t.get("completed") else ""
-            tl.setStyleSheet(f"color:{DIM if t.get('completed') else TEXT};{done_s}background:transparent;")
-            tl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); lay.addWidget(tl)
-            eb = ghost_btn("Edit", DIM)
-            def do_edit(task=t):
-                dlg = TaskDetailDialog(self, task, self._data, self._app)
-                dlg.accepted_sig.connect(self._render); dlg.exec_()
-            eb.clicked.connect(lambda _c, f=do_edit: f()); lay.addWidget(eb)
-            self._ll.addWidget(row)
-        self._ll.addStretch()
+        # if our current node was deleted, climb to the root task or close
+        if task_by_id(self._data, self._pid) is None:
+            if task_by_id(self._data, self._root) is None:
+                self.close(); return
+            self._pid = self._root
+            self._grid.parent_id = self._root
+        self._grid.rebuild()
 
-    def _add(self):
-        dlg = AddTaskDialog(self, self._data, self._app, self._ptask["id"])
-        dlg.accepted.connect(self._render); dlg.exec_()
+# ══════════════════════════════════════════════════════════════════════════════
+# Notes — sidebar pages + rich editor with image paste / drag-resize
+# ══════════════════════════════════════════════════════════════════════════════
+class _ImageHandle(QWidget):
+    def __init__(self, viewport, editor, img_pos, img_w, anchor_rect):
+        super().__init__(viewport)
+        self._editor, self._img_pos = editor, img_pos
+        self._drag_from, self._start_w = None, img_w
+        self.setFixedSize(14, 14)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setStyleSheet(f"background: {ACC}; border: 1px solid #111; border-radius: 3px;")
+        x = min(anchor_rect.left() + img_w - 7, viewport.width() - 15)
+        y = min(anchor_rect.top() + anchor_rect.height() - 7, viewport.height() - 15)
+        self.move(max(0, x), max(0, y))
 
-    def _render(self): self._render()  # alias so app.refresh() can call it
-    # override properly:
-    def _render(self):
-        while self._ll.count():
-            item = self._ll.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        subs = [t for t in self._data["tasks"] if t.get("parent_id")==self._ptask["id"]]
-        subs.sort(key=lambda t:(t.get("completed",False),{"high":0,"medium":1,"low":2}.get(t["priority"],2)))
-        for t in subs:
-            sc = stage_color(self._data, t["stage"])
-            row = QFrame(); row.setStyleSheet(f"QFrame{{background:{TILE_BG.get(t['priority'],BG3)};border-radius:7px;}}")
-            lay = QHBoxLayout(row); lay.setContentsMargins(6,3,6,3); lay.setSpacing(8)
-            ck = list_ck(t.get("completed", False))
-            def tog(s, task=t):
-                task["completed"] = bool(s); save(self._data)
-                self._app.refresh(); self._render()
-            ck.stateChanged.connect(tog); lay.addWidget(ck)
-            tl = QLabel(t["title"]); done_s="text-decoration:line-through;" if t.get("completed") else ""
-            tl.setStyleSheet(f"color:{DIM if t.get('completed') else TEXT};{done_s}background:transparent;")
-            tl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); lay.addWidget(tl)
-            eb = ghost_btn("Edit", DIM)
-            def do_edit(task=t):
-                dlg = TaskDetailDialog(self, task, self._data, self._app)
-                dlg.accepted_sig.connect(self._render); dlg.exec_()
-            eb.clicked.connect(lambda _c, f=do_edit: f()); lay.addWidget(eb)
-            self._ll.addWidget(row)
-        self._ll.addStretch()
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_from = e.globalPos()
+            self._start_w = self._width_now()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Settings dialog
-# ═════════════════════════════════════════════════════════════════════════════
-class SettingsDialog(BaseDialog):
-    def __init__(self, parent, data, cfg, app):
-        super().__init__(parent, "Settings", 540, 680)
-        self._data = data; self._cfg = cfg; self._app = app; self._build()
+    def mouseMoveEvent(self, e):
+        if self._drag_from:
+            self._apply(max(48, self._start_w + e.globalPos().x() - self._drag_from.x()))
 
-    def _build(self):
-        self.add(self.field_label("TILE SIZE  (window width ÷ tile size = columns)"))
-        tr = QHBoxLayout(); tr.addWidget(QLabel("Tile size (px):"))
-        self._ts = QSpinBox(); self._ts.setRange(140, 400); self._ts.setValue(self._cfg.get("tile_size",220))
-        self._ts.setFixedWidth(80); tr.addWidget(self._ts); tr.addStretch(); self.add_lay(tr)
+    def mouseReleaseEvent(self, e): self._drag_from = None
 
-        # ── Priority colours ───────────────────────────────────────────────
-        sep0 = QFrame(); sep0.setFrameShape(QFrame.HLine); sep0.setStyleSheet(f"color:{BDR};"); self.add(sep0)
-        self.add(self.field_label("PRIORITY COLOURS"))
-        ph = QLabel("Left swatch = tile background · Right swatch = accent / text colour")
-        ph.setStyleSheet(f"color:{DIM}; font-size:8pt;"); self.add(ph)
+    def _cursor(self):
+        c = QTextCursor(self._editor.document())
+        c.setPosition(self._img_pos)
+        return c
 
-        self._prio_cvs = {}
-        for prio, label in [("high","High"), ("medium","Medium"), ("low","Low")]:
-            r = QHBoxLayout()
-            r.addWidget(QLabel(f"{label}:"))
-            bg_cv  = [TILE_BG[prio]]
-            acc_cv = [TILE_ACC[prio]]
+    def _width_now(self):
+        try:
+            w = int(self._cursor().charFormat().toImageFormat().width())
+            return w or 400
+        except Exception:
+            return 400
 
-            def _swatch(cv, parent=self):
-                btn = QPushButton(); btn.setFixedSize(36, 26)
-                btn.setStyleSheet(f"background:{cv[0]};border-radius:6px;border:none;")
-                def pick(checked=False, b=btn, c=cv):
-                    res = QColorDialog.getColor(QColor(c[0]), parent)
-                    if res.isValid():
-                        c[0] = res.name()
-                        b.setStyleSheet(f"background:{res.name()};border-radius:6px;border:none;")
-                btn.clicked.connect(pick)
-                return btn
+    def _apply(self, w):
+        c = self._cursor()
+        fmt = c.charFormat().toImageFormat()
+        fmt.setWidth(w)
+        c.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
+        c.mergeCharFormat(fmt)
+        r = self._editor.cursorRect(self._cursor())
+        self.move(max(0, min(r.left() + w - 7, self.parent().width() - 15)), self.y())
 
-            r.addWidget(_swatch(bg_cv));  r.addWidget(QLabel("bg"))
-            r.addWidget(_swatch(acc_cv)); r.addWidget(QLabel("accent"))
-            r.addStretch()
-            self._prio_cvs[prio] = (bg_cv, acc_cv)
-            self.add_lay(r)
 
-        # ── Progress stages ────────────────────────────────────────────────
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setStyleSheet(f"color:{BDR};"); self.add(sep)
-        self.add(self.field_label("PROGRESS STAGES"))
-        hint = QLabel("Click swatch to change colour.  Stages are shown on each tile's pill.")
-        hint.setStyleSheet(f"color:{DIM}; font-size:8pt;"); self.add(hint)
+class NotesEditor(QTextEdit):
+    """Rich editor: paste images from clipboard, click an image for a resize grip."""
+    def __init__(self):
+        super().__init__()
+        self._handle = None
+        self.setAcceptRichText(True)
+        self.viewport().installEventFilter(self)
 
-        self._srows = []
-        for s in self._data.get("stages", DEFAULT_STAGES):
-            r = QHBoxLayout()
-            ne = QLineEdit(s["name"]); ne.setFixedWidth(180)
-            sw = QPushButton(); sw.setFixedSize(30,26)
-            cv = [s["color"]]
-            sw.setStyleSheet(f"background:{s['color']};border-radius:6px;border:none;")
-            def pick(btn=sw, c=cv): res=QColorDialog.getColor(QColor(c[0]),self); \
-                (res.isValid() and [c.__setitem__(0,res.name()), btn.setStyleSheet(f"background:{res.name()};border-radius:6px;border:none;")])
-            sw.clicked.connect(pick)
-            del_btn = ghost_btn("✕", "#ff607a"); del_btn.setFixedSize(26,26)
-            def do_del(sid=s["id"]):
-                self._data["stages"] = [x for x in self._data["stages"] if x["id"] != sid]
-                save(self._data); self.reject()
-                SettingsDialog(self._app, self._data, self._cfg, self._app).exec_()
-            del_btn.clicked.connect(lambda _c, f=do_del: f())
-            r.addWidget(ne); r.addWidget(sw); r.addWidget(del_btn); r.addStretch()
-            self._srows.append((s["id"],ne,cv)); self.add_lay(r)
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            img = QImage(source.imageData())
+            if not img.isNull():
+                buf = QBuffer(); buf.open(QIODevice.WriteOnly)
+                img.save(buf, "PNG")
+                b64 = base64.b64encode(bytes(buf.data())).decode()
+                w = min(480, img.width())
+                self.insertHtml(f'<img src="data:image/png;base64,{b64}" width="{w}"><br>')
+                return
+        super().insertFromMimeData(source)
 
-        ab = ghost_btn("+ Add Stage"); ab.clicked.connect(self._add_stage); self.add(ab)
-        self.add_stretch()
-        br = QHBoxLayout()
-        sv = primary_btn("Save"); sv.clicked.connect(self._save)
-        cl = ghost_btn("Cancel"); cl.clicked.connect(self.reject)
-        br.addWidget(sv); br.addStretch(); br.addWidget(cl); self.add_lay(br)
+    def eventFilter(self, obj, event):
+        if obj is self.viewport() and event.type() == QEvent.MouseButtonPress \
+                and event.button() == Qt.LeftButton:
+            if self._handle:
+                self._handle.deleteLater(); self._handle = None
+            cur = self.cursorForPosition(event.pos())
+            img_cur = self._find_image(cur)
+            if img_cur is not None:
+                fmt = img_cur.charFormat().toImageFormat()
+                try: w = int(fmt.width()) or 400
+                except Exception: w = 400
+                r = self.cursorRect(img_cur)
+                self._handle = _ImageHandle(self.viewport(), self,
+                                            img_cur.position(), w, r)
+                self._handle.show()
+        return False
 
-        # ── Version ────────────────────────────────────────────────────────
-        ver = QLabel(f"TileDo  v{APP_VERSION}")
-        ver.setAlignment(Qt.AlignCenter)
-        ver.setStyleSheet(f"color:{DIM}; font-size:8pt; background:transparent;")
-        self.add(ver)
+    def _find_image(self, cursor):
+        doc = self.document()
+        for p in (cursor.position(), cursor.position() - 1):
+            if 0 <= p < doc.characterCount() and ord(doc.characterAt(p)) == 0xFFFC:
+                c = QTextCursor(doc); c.setPosition(p)
+                return c
+        return None
 
-    def _add_stage(self):
-        new_id = f"stage_{len(self._data['stages'])}"
-        self._data["stages"].append({"id":new_id,"name":"New Stage","color":"#888899"})
-        self.reject(); SettingsDialog(self._app,self._data,self._cfg,self._app).exec_()
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        if self._handle:
+            self._handle.deleteLater(); self._handle = None
 
-    def _save(self):
-        self._cfg["tile_size"] = self._ts.value()
-        # Apply priority colours to module-level globals (TileCard reads these)
-        for prio, (bg_cv, acc_cv) in self._prio_cvs.items():
-            TILE_BG[prio]  = bg_cv[0]
-            TILE_ACC[prio] = acc_cv[0]
-        for sid,ne,cv in self._srows:
-            for s in self._data["stages"]:
-                if s["id"]==sid:
-                    n=ne.text().strip()
-                    if n: s["name"]=n
-                    s["color"]=cv[0]
-        save(self._data); save_cfg(self._cfg); self._app.refresh(); self.accept()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Replace dialog — swap a visible tile with a queued task
-# ═════════════════════════════════════════════════════════════════════════════
-class ReplaceDialog(BaseDialog):
-    def __init__(self, parent, cur_task, data, app, refresh_cb):
-        super().__init__(parent, f"Replace: {cur_task['title'][:38]}", 640, 540)
-        self._cur = cur_task; self._data = data; self._app = app; self._cb = refresh_cb
+class NotesView(QWidget):
+    def __init__(self, notes, app):
+        super().__init__()
+        self._notes, self._app = notes, app
+        self._cur = None
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self.flush)
         self._build()
 
     def _build(self):
-        hint = QLabel("Select a task to show in this tile's place — the current tile moves to the queue.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {DIM}; font-size: 9pt;"); self.add(hint)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
 
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
-        self.add(scroll)
-        lw = QWidget(); lw.setStyleSheet(f"background: {BG2};")
-        ll = QVBoxLayout(lw); ll.setContentsMargins(0, 4, 0, 4); ll.setSpacing(5)
-        scroll.setWidget(lw)
+        # sidebar
+        side = QFrame()
+        side.setFixedWidth(190)
+        side.setStyleSheet(f"QFrame {{ background: {NAV}; border-right: 1px solid {BDR}; }}")
+        sv = QVBoxLayout(side); sv.setContentsMargins(8, 8, 8, 8); sv.setSpacing(5)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search pages…")
+        self._search.textChanged.connect(self._render_pages)
+        sv.addWidget(self._search)
+        self._page_scroll = QScrollArea()
+        self._page_scroll.setWidgetResizable(True)
+        self._page_scroll.setFrameShape(QFrame.NoFrame)
+        self._page_box = QWidget(); self._page_box.setStyleSheet("background: transparent;")
+        self._page_v = QVBoxLayout(self._page_box)
+        self._page_v.setContentsMargins(0, 0, 0, 0); self._page_v.setSpacing(3)
+        self._page_scroll.setWidget(self._page_box)
+        sv.addWidget(self._page_scroll, 1)
+        addp = btn_quiet("＋ New page")
+        addp.clicked.connect(self._add_page)
+        sv.addWidget(addp)
+        lay.addWidget(side)
 
-        tasks = [t for t in self._data["tasks"]
-                 if not t.get("completed") and not t.get("recurring")
-                 and t.get("parent_id") == self._cur.get("parent_id")
-                 and t["id"] != self._cur["id"]
-                 and t["priority"] == self._cur["priority"]]
-        tasks.sort(key=lambda t: ({"high":0,"medium":1,"low":2}.get(t["priority"],2), t.get("order",9999)))
+        # editor column
+        col = QVBoxLayout(); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(0)
+        tb = QFrame()
+        tb.setStyleSheet(f"QFrame {{ background: {SURF2}; border-bottom: 1px solid {BDR}; }}")
+        tl = QHBoxLayout(tb); tl.setContentsMargins(8, 3, 8, 3); tl.setSpacing(1)
+        for text, tip, fn in (
+            ("H1", "Heading 1", lambda: self._heading(16)),
+            ("H2", "Heading 2", lambda: self._heading(13)),
+            ("H3", "Heading 3", lambda: self._heading(11)),
+            ("B",  "Bold  (Ctrl+B)", self._bold),
+            ("I",  "Italic  (Ctrl+I)", self._italic),
+            ("U",  "Underline", self._underline),
+            ("•",  "Bullet list", self._bullet),
+            ("🖼", "Insert image (or just paste one)", self._image),
+            ("Aa", "Normal text", self._normal),
+        ):
+            b = btn_icon(text, tip, 30)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            tl.addWidget(b)
+        tl.addStretch()
+        col.addWidget(tb)
+        self._editor = NotesEditor()
+        self._editor.setStyleSheet(
+            f"QTextEdit {{ background: {BG}; border: none; padding: 14px; font-size: 10pt; }}")
+        self._editor.textChanged.connect(lambda: self._save_timer.start(700))
+        col.addWidget(self._editor, 1)
+        wrap = QWidget(); wrap.setLayout(col)
+        wrap.setStyleSheet("background: transparent;")
+        lay.addWidget(wrap, 1)
 
-        if not tasks:
-            ll.addWidget(QLabel("  No other tasks available.")); ll.addStretch()
+        QShortcut(QKeySequence.Bold, self._editor, activated=self._bold)
+        QShortcut(QKeySequence.Italic, self._editor, activated=self._italic)
+
+        self._render_pages()
+        tabs = self._notes["tabs"]
+        if tabs: self._select(tabs[0]["id"])
+
+    # ── pages ────────────────────────────────────────────────────────────────
+    def _render_pages(self):
+        while self._page_v.count():
+            it = self._page_v.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        q = self._search.text().strip().lower()
+        for tab in self._notes["tabs"]:
+            if q:
+                plain = re.sub(r"<[^>]+>", " ", tab.get("html", "")).lower()
+                if q not in tab["name"].lower() and q not in plain:
+                    continue
+            self._page_v.addWidget(self._page_row(tab))
+        self._page_v.addStretch()
+
+    def _page_row(self, tab):
+        row = QFrame()
+        active = tab["id"] == self._cur
+        row.setStyleSheet(
+            f"QFrame {{ background: {'#272b2f' if active else 'transparent'}; "
+            f"border: none; border-radius: 5px; }}"
+            f"QFrame:hover {{ background: #232729; }}")
+        rl = QHBoxLayout(row); rl.setContentsMargins(4, 1, 2, 1); rl.setSpacing(2)
+        b = QPushButton(tab["name"])
+        b.setCursor(Qt.PointingHandCursor)
+        b.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; text-align: left; "
+            f"color: {ACC if active else DIM}; font-weight: {'700' if active else '500'}; "
+            f"padding: 5px 4px; }}"
+            f"QPushButton:hover {{ color: {TEXT}; }}")
+        b.clicked.connect(lambda _=False, tid=tab["id"]: self._select(tid))
+        rl.addWidget(b, 1)
+        rn = btn_icon("✎", "Rename", 22)
+        rn.clicked.connect(lambda _=False, tid=tab["id"]: self._rename(tid))
+        de = btn_icon("✕", "Delete page", 22)
+        de.clicked.connect(lambda _=False, tid=tab["id"]: self._delete(tid))
+        rl.addWidget(rn); rl.addWidget(de)
+        return row
+
+    def _tab(self, tid):
+        for t in self._notes["tabs"]:
+            if t["id"] == tid: return t
+        return None
+
+    def _select(self, tid):
+        self.flush()
+        self._cur = tid
+        tab = self._tab(tid)
+        blocker = self._editor.blockSignals(True)
+        self._editor.setHtml(tab.get("html", "") if tab else "")
+        self._editor.blockSignals(blocker)
+        self._render_pages()
+
+    def _add_page(self):
+        dlg = TextPromptDialog(self.window(), "New page", "Page name", "New page")
+        if dlg.exec_() == QDialog.Accepted and dlg.value():
+            t = {"id": str(uuid.uuid4()), "name": dlg.value(), "html": ""}
+            self._notes["tabs"].append(t)
+            save_notes(self._notes)
+            self._select(t["id"])
+
+    def _rename(self, tid):
+        tab = self._tab(tid)
+        if not tab: return
+        dlg = TextPromptDialog(self.window(), "Rename page", "Page name", tab["name"])
+        if dlg.exec_() == QDialog.Accepted and dlg.value():
+            tab["name"] = dlg.value()
+            save_notes(self._notes)
+            self._render_pages()
+
+    def _delete(self, tid):
+        tab = self._tab(tid)
+        if not tab: return
+        plain = re.sub(r"<[^>]+>", "", tab.get("html", "")).strip()
+        if plain or "img" in tab.get("html", ""):
+            if ConfirmDialog(self.window(), f"Delete page “{tab['name']}” and its content?""").exec_() != QDialog.Accepted:
+                return
+        self._notes["tabs"] = [t for t in self._notes["tabs"] if t["id"] != tid]
+        if not self._notes["tabs"]:
+            self._notes["tabs"] = [{"id": str(uuid.uuid4()), "name": "Notes", "html": ""}]
+        save_notes(self._notes)
+        if self._cur == tid:
+            self._cur = None
+            self._select(self._notes["tabs"][0]["id"])
         else:
-            for t in tasks:
-                row = QFrame()
-                row.setStyleSheet(f"QFrame{{background:{TILE_BG.get(t['priority'],BG3)};border-radius:8px;}}")
-                rl = QHBoxLayout(row); rl.setContentsMargins(8,5,8,5); rl.setSpacing(8)
-                pc = TILE_ACC.get(t["priority"], DIM)
-                tag = QLabel(PL.get(t["priority"],"?"))
-                tag.setStyleSheet(f"color:{pc};font-weight:bold;font-size:8pt;background:transparent;")
-                tag.setFixedWidth(30)
-                tl = QLabel(t["title"]); tl.setStyleSheet(f"color:{TEXT};background:transparent;")
-                tl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                sel = primary_btn("Select"); sel.setFixedHeight(28)
-                def do_swap(task=t):
-                    # Renumber peers so we get clean integer orders
-                    peers = [x for x in self._data["tasks"]
-                             if not x.get("completed") and not x.get("recurring")
-                             and x.get("parent_id") == self._cur.get("parent_id")]
-                    peers.sort(key=lambda x: x.get("order", 9999))
-                    for i, p in enumerate(peers): p["order"] = i * 10
-                    # Swap orders between current and target
-                    cur_o, tgt_o = self._cur["order"], task["order"]
-                    self._cur["order"] = tgt_o
-                    task["order"] = cur_o
-                    save(self._data); self._app.refresh(); self._cb(); self.accept()
-                sel.clicked.connect(lambda _c, f=do_swap: f())
-                rl.addWidget(tag); rl.addWidget(tl); rl.addWidget(sel)
-                ll.addWidget(row)
-            ll.addStretch()
+            self._render_pages()
 
-        cl = ghost_btn("Cancel"); cl.clicked.connect(self.reject); self.add(cl)
+    # ── persistence ──────────────────────────────────────────────────────────
+    def flush(self):
+        """Write the current page immediately (called on timer, page switch, close)."""
+        if not self._cur:
+            return
+        tab = self._tab(self._cur)
+        if tab is not None:
+            html = self._editor.toHtml()
+            if html != tab.get("html"):
+                tab["html"] = html
+                save_notes(self._notes)
 
-# ═════════════════════════════════════════════════════════════════════════════
+    # ── formatting ───────────────────────────────────────────────────────────
+    def _merge(self, fmt):
+        c = self._editor.textCursor()
+        c.mergeCharFormat(fmt)
+        self._editor.setTextCursor(c)
+
+    def _heading(self, pt):
+        f = QTextCharFormat(); f.setFontPointSize(pt); f.setFontWeight(QFont.Bold)
+        self._merge(f)
+
+    def _bold(self):
+        cur = self._editor.textCursor().charFormat().fontWeight()
+        f = QTextCharFormat()
+        f.setFontWeight(QFont.Normal if cur == QFont.Bold else QFont.Bold)
+        self._merge(f)
+
+    def _italic(self):
+        f = QTextCharFormat()
+        f.setFontItalic(not self._editor.textCursor().charFormat().fontItalic())
+        self._merge(f)
+
+    def _underline(self):
+        f = QTextCharFormat()
+        f.setFontUnderline(not self._editor.textCursor().charFormat().fontUnderline())
+        self._merge(f)
+
+    def _bullet(self):
+        self._editor.textCursor().insertList(QTextListFormat.ListDisc)
+
+    def _normal(self):
+        f = QTextCharFormat()
+        f.setFontPointSize(10); f.setFontWeight(QFont.Normal)
+        f.setFontItalic(False); f.setFontUnderline(False)
+        self._merge(f)
+
+    def _image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Insert image", "", "Images (*.png *.jpg *.jpeg *.gif *.bmp)")
+        if not path: return
+        data = base64.b64encode(Path(path).read_bytes()).decode()
+        ext = Path(path).suffix.lstrip(".").lower()
+        mime = "jpeg" if ext in ("jpg", "jpeg") else ext
+        self._editor.insertHtml(
+            f'<img src="data:image/{mime};base64,{data}" width="420"><br>')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Auto-update — check GitHub releases, download, swap the exe via helper .bat
+# ══════════════════════════════════════════════════════════════════════════════
+def _ver_tuple(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+class UpdateCheckThread(QThread):
+    found = pyqtSignal(str, str)      # version string, download url
+    fail  = pyqtSignal(str)
+
+    def run(self):
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "TileDo"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                j = json.load(r)
+            ver = j.get("name", "") or j.get("tag_name", "")
+            dl = ""
+            for a in j.get("assets", []):
+                if a.get("name") == "TileDo.exe":
+                    dl = a.get("browser_download_url", ""); break
+            if not dl:
+                self.fail.emit("No exe asset found in the latest release."); return
+            self.found.emit(ver, dl)
+        except Exception as ex:
+            self.fail.emit(f"Check failed: {ex}")
+
+
+class DownloadThread(QThread):
+    progress = pyqtSignal(int)        # 0-100, or -1 for unknown size
+    done     = pyqtSignal(str)
+    fail     = pyqtSignal(str)
+
+    def __init__(self, url, dest):
+        super().__init__()
+        self._url, self._dest = url, dest
+
+    def run(self):
+        try:
+            req = urllib.request.Request(self._url, headers={"User-Agent": "TileDo"})
+            with urllib.request.urlopen(req, timeout=30) as r, open(self._dest, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                got = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk: break
+                    f.write(chunk); got += len(chunk)
+                    self.progress.emit(int(got * 100 / total) if total else -1)
+            self.done.emit(str(self._dest))
+        except Exception as ex:
+            self.fail.emit(f"Download failed: {ex}")
+
+
+def apply_update_and_restart(new_exe: str):
+    """Write a helper .bat that waits for this process to exit, swaps the exe,
+    relaunches it, then deletes itself."""
+    cur = Path(sys.executable)
+    bat = DATA_DIR / "tiledo_update.bat"
+    bat.write_text(
+        "@echo off\r\n"
+        f"set PID={os.getpid()}\r\n"
+        ":wait\r\n"
+        "tasklist /FI \"PID eq %PID%\" 2>nul | findstr /r \"\\<%PID%\\>\" >nul\r\n"
+        "if not errorlevel 1 (\r\n"
+        "  timeout /t 1 /nobreak >nul\r\n"
+        "  goto wait\r\n"
+        ")\r\n"
+        "set /a tries=0\r\n"
+        ":try\r\n"
+        f"move /y \"{new_exe}\" \"{cur}\" >nul 2>&1\r\n"
+        "if errorlevel 1 (\r\n"
+        "  set /a tries+=1\r\n"
+        "  if %tries% lss 15 ( timeout /t 1 /nobreak >nul & goto try )\r\n"
+        ")\r\n"
+        f"start \"\" \"{cur}\"\r\n"
+        "del \"%~f0\"\r\n",
+        encoding="ascii")
+    CREATE_NO_WINDOW, DETACHED = 0x08000000, 0x00000008
+    subprocess.Popen(["cmd", "/c", str(bat)],
+                     creationflags=CREATE_NO_WINDOW | DETACHED,
+                     close_fds=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Settings
+# ══════════════════════════════════════════════════════════════════════════════
+class SettingsDialog(BaseDialog):
+    def __init__(self, parent, data, cfg, app):
+        super().__init__(parent, "Settings", 540, 660)
+        self._data, self._cfg, self._app = data, cfg, app
+        self._stage_rows = []          # (id-or-None, name_edit, colour_cell, deleted_flag)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+        inner = QWidget(); inner.setStyleSheet("background: transparent;")
+        self._iv = QVBoxLayout(inner)
+        self._iv.setContentsMargins(2, 2, 8, 2); self._iv.setSpacing(9)
+        sc.setWidget(inner)
+        self.add(sc)
+        self._build(self._iv)
+        row = QHBoxLayout()
+        ok = btn_primary("Save"); ok.clicked.connect(self._save)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        row.addStretch(); row.addWidget(no); row.addWidget(ok)
+        self.add_lay(row)
+        ver = QLabel(f"TileDo v{APP_VERSION}")
+        ver.setAlignment(Qt.AlignCenter)
+        ver.setStyleSheet(f"color: {FAINT}; font-size: 8pt; background: transparent;")
+        self.add(ver)
+
+    def _swatch(self, holder):
+        b = QPushButton(); b.setFixedSize(34, 24)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setStyleSheet(f"background: {holder[0]}; border-radius: 5px; border: 1px solid {BDR_H};")
+
+        def pick(_=False):
+            c = QColorDialog.getColor(QColor(holder[0]), self)
+            if c.isValid():
+                holder[0] = c.name()
+                b.setStyleSheet(f"background: {c.name()}; border-radius: 5px; border: 1px solid {BDR_H};")
+        b.clicked.connect(pick)
+        return b
+
+    def _build(self, v):
+        v.addWidget(micro_label("Grid"))
+        gr = QHBoxLayout()
+        gr.addWidget(QLabel("Card width (px):"))
+        self._ts = QSpinBox(); self._ts.setRange(150, 420)
+        self._ts.setValue(self._cfg.get("tile_size", 230)); self._ts.setFixedWidth(76)
+        gr.addWidget(self._ts); gr.addStretch()
+        v.addLayout(gr)
+
+        v.addWidget(sep_line())
+        v.addWidget(micro_label("Priority colours"))
+        self._prio_holders = {}
+        for p in ("high", "medium", "low"):
+            holder = [PRIO_COLOR[p]]
+            self._prio_holders[p] = holder
+            r = QHBoxLayout()
+            lab = QLabel(PRIO_LABEL[p]); lab.setFixedWidth(70)
+            r.addWidget(lab); r.addWidget(self._swatch(holder)); r.addStretch()
+            v.addLayout(r)
+
+        v.addWidget(sep_line())
+        v.addWidget(micro_label("Progress stages"))
+        self._stage_box = QVBoxLayout(); self._stage_box.setSpacing(5)
+        v.addLayout(self._stage_box)
+        for s in self._data.get("stages", []):
+            self._stage_row(s["id"], s["name"], s["color"])
+        add_s = btn_quiet("＋ Add stage")
+        add_s.clicked.connect(lambda _=False: self._stage_row(None, "New stage", "#7a8088"))
+        v.addWidget(add_s)
+
+        v.addWidget(sep_line())
+        v.addWidget(micro_label("Updates"))
+        ur = QHBoxLayout()
+        self._upd_status = QLabel(f"Current version: v{APP_VERSION}")
+        self._upd_status.setStyleSheet(f"color: {DIM}; background: transparent;")
+        ur.addWidget(self._upd_status, 1)
+        self._chk_btn = btn_quiet("Check for updates")
+        self._chk_btn.clicked.connect(self._check_updates)
+        ur.addWidget(self._chk_btn)
+        v.addLayout(ur)
+        self._auto_ck = QCheckBox("Check automatically on startup")
+        self._auto_ck.setChecked(self._cfg.get("auto_update", True))
+        v.addWidget(self._auto_ck)
+        self._dl_bar = QProgressBar(); self._dl_bar.setRange(0, 100); self._dl_bar.hide()
+        v.addWidget(self._dl_bar)
+        self._install_btn = btn_primary("Download && install")
+        self._install_btn.hide()
+        self._install_btn.clicked.connect(self._install)
+        v.addWidget(self._install_btn)
+        self._found_url = None
+        if self._app.pending_update:
+            ver, url = self._app.pending_update
+            self._offer(ver, url)
+
+        v.addWidget(sep_line())
+        v.addWidget(micro_label("Data"))
+        dr = QHBoxLayout()
+        p = QLabel(str(DATA_DIR)); p.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
+        dr.addWidget(p, 1)
+        op = btn_quiet("Open folder")
+        op.clicked.connect(lambda _=False: os.startfile(str(DATA_DIR)))
+        dr.addWidget(op)
+        v.addLayout(dr)
+        v.addStretch()
+
+    def _stage_row(self, sid, name, color):
+        row = QWidget(); rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(6)
+        ne = QLineEdit(name); ne.setFixedWidth(190)
+        holder = [color]
+        sw = self._swatch(holder)
+        de = btn_icon("✕", "Remove stage", 24)
+        entry = {"id": sid, "name_edit": ne, "color": holder, "row": row, "deleted": False}
+
+        def remove(_=False):
+            live = [e for e in self._stage_rows if not e["deleted"]]
+            if len(live) <= 1:
+                return                      # keep at least one stage
+            entry["deleted"] = True
+            row.hide()
+        de.clicked.connect(remove)
+        rl.addWidget(ne); rl.addWidget(sw); rl.addWidget(de); rl.addStretch()
+        self._stage_box.addWidget(row)
+        self._stage_rows.append(entry)
+
+    # ── updates ──────────────────────────────────────────────────────────────
+    def _check_updates(self):
+        self._chk_btn.setEnabled(False)
+        self._upd_status.setText("Checking…")
+        self._checker = UpdateCheckThread()
+        self._checker.found.connect(self._on_found)
+        self._checker.fail.connect(self._on_fail)
+        self._checker.start()
+
+    def _on_found(self, ver, url):
+        self._chk_btn.setEnabled(True)
+        if _ver_tuple(ver) > _ver_tuple(APP_VERSION):
+            self._offer(ver, url)
+        else:
+            self._upd_status.setText(f"Up to date ✓  (v{APP_VERSION})")
+
+    def _offer(self, ver, url):
+        self._found_url = url
+        self._app.pending_update = (ver, url)
+        self._upd_status.setText(f"Update available: {ver}")
+        self._upd_status.setStyleSheet(f"color: {ACC}; background: transparent;")
+        if getattr(sys, "frozen", False):
+            self._install_btn.show()
+        else:
+            self._upd_status.setText(
+                f"Update available: {ver} — running from source, use git pull")
+
+    def _on_fail(self, msg):
+        self._chk_btn.setEnabled(True)
+        self._upd_status.setText(msg)
+
+    def _install(self):
+        if not self._found_url: return
+        self._install_btn.setEnabled(False)
+        self._dl_bar.show(); self._dl_bar.setValue(0)
+        dest = DATA_DIR / "TileDo_new.exe"
+        self._dl = DownloadThread(self._found_url, dest)
+        self._dl.progress.connect(
+            lambda p: self._dl_bar.setValue(p if p >= 0 else 50))
+        self._dl.fail.connect(self._on_fail)
+        self._dl.done.connect(self._on_downloaded)
+        self._dl.start()
+
+    def _on_downloaded(self, path):
+        self._upd_status.setText("Restarting to apply update…")
+        apply_update_and_restart(path)
+        self.accept()
+        self._app.close()
+
+    # ── save ─────────────────────────────────────────────────────────────────
+    def _save(self):
+        self._cfg["tile_size"] = self._ts.value()
+        self._cfg["auto_update"] = self._auto_ck.isChecked()
+        for p, holder in self._prio_holders.items():
+            PRIO_COLOR[p] = holder[0]
+
+        kept, removed_ids = [], set()
+        for e in self._stage_rows:
+            if e["deleted"]:
+                if e["id"]: removed_ids.add(e["id"])
+                continue
+            name = e["name_edit"].text().strip() or "Stage"
+            kept.append({"id": e["id"] or str(uuid.uuid4()),
+                         "name": name, "color": e["color"][0]})
+        if not kept:
+            kept = [dict(s) for s in DEFAULT_STAGES]
+        self._data["stages"] = kept
+        # remap tasks whose stage was deleted so they never show a raw id
+        valid = {s["id"] for s in kept}
+        fallback = kept[0]["id"]
+        for t in self._data["tasks"]:
+            if t.get("stage") not in valid:
+                t["stage"] = fallback
+
+        save_data(self._data)
+        save_cfg(self._cfg)
+        self._app.refresh()
+        self.accept()
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main window
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._data = load(); self._cfg = load_cfg()
+        self.data = load_data()
+        self.cfg = load_cfg()
+        self.notes = load_notes()
+        self.pending_update = None
+        self._parent_id = None
+        self._children = []           # tracked non-modal windows
+
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(self._cfg.get("w",980), self._cfg.get("h",740))
-        self.move(self._cfg.get("x",100), self._cfg.get("y",60))
-        self._child_windows = []
-        self._build(); self.update_meta()
+        self.setMinimumSize(480, 360)
+        self._restore_geometry()
+        self._build()
+        self.update_meta()
+        if self.cfg.get("auto_update", True):
+            QTimer.singleShot(4000, self._auto_check)
 
+    # ── geometry ─────────────────────────────────────────────────────────────
+    def _restore_geometry(self):
+        r = QRect(self.cfg.get("x", 100), self.cfg.get("y", 60),
+                  self.cfg.get("w", 1000), self.cfg.get("h", 720))
+        visible = False
+        for s in QApplication.screens():
+            if s.availableGeometry().intersected(r).width() > 60:
+                visible = True; break
+        if not visible:
+            s = QApplication.primaryScreen().availableGeometry()
+            r.moveCenter(s.center())
+        self.setGeometry(r)
+
+    # ── chrome ───────────────────────────────────────────────────────────────
     def _build(self):
-        central = QWidget(); central.setStyleSheet("background:transparent;")
+        central = QWidget(); central.setStyleSheet("background: transparent;")
         self.setCentralWidget(central)
-        outer = QVBoxLayout(central); outer.setContentsMargins(10,10,10,10); outer.setSpacing(0)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
 
-        self._frame = QFrame(); self._frame.setObjectName("mf")
-        self._frame.setStyleSheet(f"#mf{{background:{BG2};border-radius:14px;border:1px solid {BDR};}}")
-        sh = QGraphicsDropShadowEffect(self); sh.setBlurRadius(40)
-        sh.setColor(QColor(0,0,0,210)); sh.setOffset(0,6); self._frame.setGraphicsEffect(sh)
-        outer.addWidget(self._frame)
+        frame = QFrame(); frame.setObjectName("root")
+        frame.setStyleSheet(
+            f"#root {{ background: {BG}; border: 1px solid {BDR_H}; border-radius: 10px; }}")
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(34); sh.setColor(QColor(0, 0, 0, 200)); sh.setOffset(0, 5)
+        frame.setGraphicsEffect(sh)
+        outer.addWidget(frame)
+        fl = QVBoxLayout(frame); fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(0)
 
-        fl = QVBoxLayout(self._frame); fl.setContentsMargins(0,0,0,0); fl.setSpacing(0)
+        # titlebar with search
+        self.bar = DragBar("TileDo", self, 42)
+        self.bar.setStyleSheet(
+            f"DragBar {{ background: {NAV}; border-top-left-radius: 10px; "
+            f"border-top-right-radius: 10px; border-bottom: 1px solid {BDR}; }}")
+        self._searchbox = QLineEdit()
+        self._searchbox.setPlaceholderText("Search…  (Ctrl+F)")
+        self._searchbox.setFixedWidth(200)
+        self._searchbox.setStyleSheet(
+            f"QLineEdit {{ background: {BG}; border: 1px solid {BDR}; border-radius: 6px; "
+            f"padding: 4px 9px; color: {TEXT}; font-size: 8.5pt; }}"
+            f"QLineEdit:focus {{ border-color: {ACC}; }}")
+        self._searchbox.textChanged.connect(self._on_search)
+        self.bar.center_slot.insertWidget(3, self._searchbox)
+        fl.addWidget(self.bar)
 
-        # Title bar
-        self._bar = DragBar("TileDo", self, 46)
-        self._bar.setStyleSheet(f"DragBar{{background:{BG};border-top-left-radius:14px;"
-                                f"border-top-right-radius:14px;border-bottom:1px solid {BDR};}}")
-        fl.addWidget(self._bar)
+        # nav row: tabs + actions
+        nav = QFrame()
+        nav.setStyleSheet(f"QFrame {{ background: {NAV}; border-bottom: 1px solid {BDR}; }}")
+        nl = QHBoxLayout(nav); nl.setContentsMargins(10, 0, 10, 0); nl.setSpacing(2)
+        self._tabs = {}
+        for key, label in (("tasks", "Tasks"), ("recurring", "Recurring"), ("notes", "Notes")):
+            b = QPushButton(label)
+            b.setCheckable(True); b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
+                f"border-bottom: 2px solid transparent; border-radius: 0; "
+                f"padding: 11px 13px; font-weight: 600; }}"
+                f"QPushButton:hover {{ color: {TEXT}; }}"
+                f"QPushButton:checked {{ color: {ACC}; border-bottom-color: {ACC}; }}")
+            b.clicked.connect(lambda _=False, k=key: self.switch_tab(k))
+            nl.addWidget(b)
+            self._tabs[key] = b
+        nl.addStretch()
+        add = btn_primary("＋ Add")
+        add.clicked.connect(self._add_clicked)
+        nl.addWidget(add)
+        allb = btn_quiet("All tasks")
+        allb.clicked.connect(self._open_all)
+        nl.addWidget(allb)
+        self._gear = btn_icon("⚙", "Settings", 30)
+        self._gear.clicked.connect(self._open_settings)
+        nl.addWidget(self._gear)
+        fl.addWidget(nav)
 
-        # Tab bar
-        tb = QWidget(); tb.setFixedHeight(42)
-        tb.setStyleSheet(f"background:{BG};border-bottom:1px solid {BDR};")
-        tbl = QHBoxLayout(tb); tbl.setContentsMargins(12,0,12,0); tbl.setSpacing(4)
+        # tasks page (breadcrumb + quick add + grid)
+        tasks_page = QWidget(); tasks_page.setStyleSheet("background: transparent;")
+        tv = QVBoxLayout(tasks_page)
+        tv.setContentsMargins(12, 8, 12, 6); tv.setSpacing(7)
+        self._crumb = Breadcrumb()
+        self._crumb.navigate.connect(self.navigate)
+        self._crumb.move_to.connect(self._move_to_ancestor)
+        tv.addWidget(self._crumb)
+        self._quick = QLineEdit()
+        self._quick.setPlaceholderText("＋  Quick add…  (Enter)")
+        self._quick.returnPressed.connect(self._quick_add)
+        tv.addWidget(self._quick)
+        self._grid = CardGrid(self, self.data, self.cfg, mode="focus", parent_id=None)
+        tv.addWidget(self._grid, 1)
+        self._done_strip = QWidget(); self._done_strip.setStyleSheet("background: transparent;")
+        self._done_v = QVBoxLayout(self._done_strip)
+        self._done_v.setContentsMargins(0, 0, 0, 0); self._done_v.setSpacing(3)
+        tv.addWidget(self._done_strip)
 
-        self._tab_btns = {}
-        for key, label in (("todo","To Do"), ("recurring","Recurring"), ("notes","Notes")):
-            btn = QPushButton(label); btn.setCheckable(True); btn.setFixedHeight(30)
-            btn.setStyleSheet(
-                f"QPushButton{{background:transparent;color:{DIM};border:none;border-radius:7px;padding:4px 14px;}}"
-                f"QPushButton:hover{{color:{TEXT};}}"
-                f"QPushButton:checked{{background:{BTN_H};color:{TEXT};font-weight:600;}}"
-            )
-            btn.clicked.connect(lambda _, k=key: self._switch_tab(k))
-            tbl.addWidget(btn); self._tab_btns[key] = btn
+        # recurring page
+        rec_page = QWidget(); rec_page.setStyleSheet("background: transparent;")
+        rv = QVBoxLayout(rec_page)
+        rv.setContentsMargins(12, 10, 12, 6); rv.setSpacing(7)
+        self._rquick = QLineEdit()
+        self._rquick.setPlaceholderText("＋  Add recurring task…  (Enter)")
+        self._rquick.returnPressed.connect(self._quick_add_rec)
+        rv.addWidget(self._rquick)
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        reset_all = btn_quiet("↺ Reset all done")
+        reset_all.clicked.connect(self._reset_recurring)
+        reset_row.addWidget(reset_all)
+        rv.addLayout(reset_row)
+        self._rec_grid = CardGrid(self, self.data, self.cfg, mode="flow", recurring=True)
+        rv.addWidget(self._rec_grid, 1)
 
-        tbl.addStretch()
-        add_btn = primary_btn("＋  Add Task"); add_btn.setFixedHeight(30)
-        add_btn.clicked.connect(self._add_task); tbl.addWidget(add_btn)
-        all_btn = ghost_btn("☰  All Tasks"); all_btn.setFixedHeight(30)
-        all_btn.clicked.connect(self._all_tasks); tbl.addWidget(all_btn)
-        cfg_btn = QPushButton("⚙"); cfg_btn.setFixedSize(34, 30)
-        cfg_btn.setToolTip("Settings")
-        cfg_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {DIM}; border: 1px solid {DIM}44; "
-            f"border-radius: 7px; font-size: 13pt; padding: 0; margin: 0; }}"
-            f"QPushButton:hover {{ background: {BTN_H}; color: {TEXT}; border-color: {BDR_H}; }}"
-        )
-        cfg_btn.clicked.connect(self._settings); tbl.addWidget(cfg_btn)
-        fl.addWidget(tb)
+        self._notes_view = NotesView(self.notes, self)
 
-        # Stacked views
-        self._stack = QStackedWidget(); self._stack.setStyleSheet(f"background:{BG2};")
-        self._todo_view = TileGrid(self._data, self._cfg, self)
-        self._rec_view  = RecurringView(self._data, self._cfg, self)
-        self._notes_view = NotesView(self._data, self)
-        self._stack.addWidget(self._todo_view)
-        self._stack.addWidget(self._rec_view)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background: transparent;")
+        self._stack.addWidget(tasks_page)
+        self._stack.addWidget(rec_page)
         self._stack.addWidget(self._notes_view)
         fl.addWidget(self._stack, 1)
 
-        # Resize grip
-        gr = QHBoxLayout(); gr.setContentsMargins(0,0,4,4); gr.addStretch()
-        grip = QSizeGrip(self._frame); grip.setStyleSheet("background:transparent;")
-        gr.addWidget(grip); fl.addLayout(gr)
+        grip_row = QHBoxLayout(); grip_row.setContentsMargins(0, 0, 3, 3)
+        grip_row.addStretch()
+        grip = QSizeGrip(frame); grip.setStyleSheet("background: transparent;")
+        grip_row.addWidget(grip)
+        fl.addLayout(grip_row)
 
-        self._switch_tab("todo")
+        QShortcut(QKeySequence("Ctrl+F"), self,
+                  activated=lambda: (self._searchbox.setFocus(), self._searchbox.selectAll()))
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self._add_clicked)
+        QShortcut(QKeySequence("Escape"), self, activated=self._escape)
 
-    def _switch_tab(self, key):
-        idx = {"todo":0,"recurring":1,"notes":2}[key]
+        self.switch_tab("tasks")
+        self._crumb.set_path(self.data, None)
+
+    # ── navigation ───────────────────────────────────────────────────────────
+    def switch_tab(self, key):
+        idx = {"tasks": 0, "recurring": 1, "notes": 2}[key]
+        if self._stack.currentIndex() == 2:
+            self._notes_view.flush()
         self._stack.setCurrentIndex(idx)
-        for k, b in self._tab_btns.items(): b.setChecked(k == key)
-        if key == "notes": self._notes_view.load_content()
-        if key == "recurring": self._rec_view.rebuild()
+        for k, b in self._tabs.items():
+            b.setChecked(k == key)
+        if key == "recurring":
+            self._rec_grid.rebuild()
+        elif key == "tasks":
+            self._grid.rebuild()
 
-    def _open_window(self, dlg):
-        """Show a non-modal window and track it for refresh."""
-        self._child_windows.append(dlg)
+    def navigate(self, parent_id):
+        # guard against navigating into a deleted task
+        if parent_id is not None and task_by_id(self.data, parent_id) is None:
+            parent_id = None
+        self._parent_id = parent_id
+        self._grid.parent_id = parent_id
+        self._grid.mode = "focus" if parent_id is None else "flow"
+        self._grid.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if parent_id is None else Qt.ScrollBarAsNeeded)
+        self._crumb.set_path(self.data, parent_id)
+        self._quick.setPlaceholderText(
+            "＋  Quick add…  (Enter)" if parent_id is None
+            else "＋  Add item here…  (Enter)")
+        self._grid.rebuild()
+        self._render_done_strip()
+
+    def open_task(self, task):
+        if self._searchbox.text().strip():
+            self._searchbox.clear()
+        self.navigate(task["id"])
+
+    def _escape(self):
+        if self._searchbox.text():
+            self._searchbox.clear(); return
+        if self._parent_id is not None:
+            t = task_by_id(self.data, self._parent_id)
+            self.navigate(t.get("parent_id") if t else None)
+
+    def _move_to_ancestor(self, src_id, parent_id):
+        src = task_by_id(self.data, src_id)
+        if not src: return
+        if parent_id is not None and (parent_id == src_id
+                or parent_id in descendant_ids(self.data, src_id)):
+            return
+        src["parent_id"] = parent_id
+        b = bucket(self.data, parent_id, src["priority"])
+        if src not in b: b.append(src)
+        renumber(b)
+        save_data(self.data)
+        self.refresh()
+
+    # ── drag & drop model ops ─────────────────────────────────────────────────
+    def handle_drop(self, src_id, target_id, mode):
+        src = task_by_id(self.data, src_id)
+        tgt = task_by_id(self.data, target_id)
+        if not src or not tgt or src_id == target_id:
+            return
+        if target_id in descendant_ids(self.data, src_id):
+            return
+        if mode == "nest":
+            nest_under(self.data, src, tgt)
+        else:
+            insert_relative(self.data, src, tgt, mode)
+        save_data(self.data)
+        self.refresh()
+
+    def handle_priority_drop(self, src_id, priority):
+        src = task_by_id(self.data, src_id)
+        if not src: return
+        src["priority"] = priority
+        src["parent_id"] = self._parent_id
+        b = bucket(self.data, self._parent_id, priority)
+        if src not in b: b.append(src)
+        renumber(b)
+        save_data(self.data)
+        self.refresh()
+
+    # ── quick add / actions ──────────────────────────────────────────────────
+    def _quick_add(self):
+        title = self._quick.text().strip()
+        if not title: return
+        t = mk_task(title, "medium", self._parent_id)
+        b = bucket(self.data, self._parent_id, "medium")
+        t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
+        self.data["tasks"].append(t)
+        save_data(self.data)
+        self._quick.clear()
+        self.refresh()
+
+    def _quick_add_rec(self):
+        title = self._rquick.text().strip()
+        if not title: return
+        t = mk_task(title, "medium", None, recurring=True)
+        b = bucket(self.data, None, "medium", recurring=True)
+        t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
+        self.data["tasks"].append(t)
+        save_data(self.data)
+        self._rquick.clear()
+        self.refresh()
+
+    def _reset_recurring(self):
+        changed = False
+        for t in self.data["tasks"]:
+            if t.get("recurring") and t.get("completed"):
+                t["completed"] = False; changed = True
+        if changed:
+            save_data(self.data)
+            self.refresh()
+
+    def _add_clicked(self):
+        if self._stack.currentIndex() == 1:
+            AddTaskDialog(self, self.data, self, recurring=True).exec_()
+        else:
+            AddTaskDialog(self, self.data, self, parent_id=self._parent_id).exec_()
+
+    def _open_all(self):
+        dlg = AllTasksDialog(self, self.data, self)
+        self._track(dlg)
+
+    def open_task_window(self, task):
+        w = TaskWindow(self, task, self.data, self.cfg, self)
+        self._track(w)
+
+    def _track(self, dlg):
+        self._children.append(dlg)
         dlg.show(); dlg.raise_(); dlg.activateWindow()
 
+    def _open_settings(self):
+        SettingsDialog(self, self.data, self.cfg, self).exec_()
+        self._gear.setText("⚙")
+
+    # ── search ───────────────────────────────────────────────────────────────
+    def _on_search(self, text):
+        if self._stack.currentIndex() == 2:
+            self._notes_view._search.setText(text)
+            return
+        q = text.strip().lower()
+        if not q:
+            self._grid.rebuild()
+            return
+        self._render_search(q)
+
+    def _render_search(self, q):
+        g = self._grid
+        for w, _ in g._items:
+            w.deleteLater()
+        g._items = []
+        if g._queued_chip:
+            g._queued_chip.deleteLater(); g._queued_chip = None
+        matches = [t for t in self.data["tasks"]
+                   if not t.get("recurring") and not t.get("completed")
+                   and (q in t["title"].lower() or q in (t.get("notes") or "").lower())]
+        matches.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), t.get("order", 0)))
+        g._add_header(None, f"Search · {len(matches)} match{'es' if len(matches) != 1 else ''}")
+        for t in matches[:60]:
+            g._add_card(t)
+        if not matches:
+            g._add_empty(f"No open tasks match “{q}”.")
+        g._relayout()
+
+    # ── done strip (completed children in drilled view) ──────────────────────
+    def _render_done_strip(self):
+        while self._done_v.count():
+            it = self._done_v.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        if self._parent_id is None:
+            return
+        done = [t for t in children_of(self.data, self._parent_id) if t.get("completed")]
+        if not done:
+            return
+        self._done_v.addWidget(micro_label(f"Completed · {len(done)}"))
+        for t in done[:8]:
+            row = QFrame()
+            row.setStyleSheet(f"QFrame {{ background: {SURF2}; border: none; border-radius: 5px; }}")
+            rl = QHBoxLayout(row); rl.setContentsMargins(7, 2, 7, 2); rl.setSpacing(7)
+            ck = QCheckBox(); ck.setChecked(True)
+
+            def untick(state, task=t):
+                if not state:
+                    task["completed"] = False
+                    save_data(self.data)
+                    self.refresh()
+            ck.stateChanged.connect(untick)
+            rl.addWidget(ck)
+            lab = QLabel(t["title"])
+            lab.setStyleSheet(f"color: {FAINT}; text-decoration: line-through; background: transparent;")
+            rl.addWidget(lab, 1)
+            self._done_v.addWidget(row)
+        if len(done) > 8:
+            more = QLabel(f"  +{len(done) - 8} more in All tasks")
+            more.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
+            self._done_v.addWidget(more)
+
+    # ── refresh fan-out ──────────────────────────────────────────────────────
     def refresh(self):
-        self._todo_view.rebuild()
-        if self._stack.currentIndex() == 1: self._rec_view.rebuild()
+        if self._parent_id is not None and task_by_id(self.data, self._parent_id) is None:
+            self.navigate(None)
+            self.update_meta()
+            return
+        if self._searchbox.text().strip() and self._stack.currentIndex() == 0:
+            self._render_search(self._searchbox.text().strip().lower())
+        else:
+            self._grid.rebuild()
+        if self._stack.currentIndex() == 1:
+            self._rec_grid.rebuild()
+        self._crumb.set_path(self.data, self._parent_id)
+        self._render_done_strip()
         self.update_meta()
-        # Refresh all open child windows
-        for w in list(self._child_windows):
+        for w in list(self._children):
             if not w.isVisible():
-                self._child_windows.remove(w)
-            elif hasattr(w, '_render'):
+                self._children.remove(w)
+            elif hasattr(w, "_render"):
                 w._render()
 
     def update_meta(self):
-        n = sum(1 for t in self._data["tasks"] if not t.get("completed") and not t.get("recurring"))
-        self._bar.set_meta(f"{n} pending")
+        self.bar.set_meta(f"{top_pending_count(self.data)} open")
 
-    def _add_task(self):
-        idx = self._stack.currentIndex()
-        if idx == 1:
-            AddTaskDialog(self, self._data, self, recurring=True).exec_()
-        else:
-            AddTaskDialog(self, self._data, self).exec_()
+    # ── updates ──────────────────────────────────────────────────────────────
+    def _auto_check(self):
+        self._auto_thread = UpdateCheckThread()
 
-    def _all_tasks(self):
-        dlg = FullListDialog(self, self._data, self)
-        self._open_window(dlg)
+        def on_found(ver, url):
+            if _ver_tuple(ver) > _ver_tuple(APP_VERSION):
+                self.pending_update = (ver, url)
+                self._gear.setText("⚙•")
+                self._gear.setToolTip(f"Update available: {ver} — open Settings")
+        self._auto_thread.found.connect(on_found)
+        self._auto_thread.fail.connect(lambda m: None)
+        self._auto_thread.start()
 
-    def _settings(self): SettingsDialog(self, self._data, self._cfg, self).exec_()
-
+    # ── shutdown ─────────────────────────────────────────────────────────────
     def closeEvent(self, e):
-        p = self.pos(); s = self.size()
-        self._cfg.update({"x":p.x(),"y":p.y(),"w":s.width(),"h":s.height()})
-        save_cfg(self._cfg); e.accept()
+        self._notes_view.flush()
+        g = self.normalGeometry() if self.isMaximized() else self.geometry()
+        self.cfg.update({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height()})
+        save_cfg(self.cfg)
+        for w in self._children:
+            try: w.close()
+            except Exception: pass
+        e.accept()
 
-if __name__ == "__main__":
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
-    app.setStyleSheet(SS)
     app.setApplicationName("TileDo")
+    app.setFont(QFont("Segoe UI", 9))
+    app.setStyleSheet(SS)
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(BG))
+    pal.setColor(QPalette.Base, QColor(SURF2))
+    pal.setColor(QPalette.Text, QColor(TEXT))
+    pal.setColor(QPalette.WindowText, QColor(TEXT))
+    pal.setColor(QPalette.Button, QColor("#272b2f"))
+    pal.setColor(QPalette.ButtonText, QColor(TEXT))
+    pal.setColor(QPalette.Highlight, QColor(ACC))
+    pal.setColor(QPalette.HighlightedText, QColor("#141414"))
+    app.setPalette(pal)
+
+    # one instance only — a second copy silently corrupting data.json was possible in v1
+    guard = QSharedMemory("tiledo-single-instance")
+    if not guard.create(1):
+        QMessageBox.information(None, "TileDo", "TileDo is already running.")
+        return 0
+
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    rc = app.exec_()
+    del guard
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

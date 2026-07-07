@@ -27,14 +27,16 @@ jobs:
 
       # Every push to main → overwrite the rolling "latest" release.
       # The download link never changes, the exe is always current.
+      # Title carries the version from tiledo.py — the in-app updater parses it.
       - name: Update latest release
         if: github.ref == 'refs/heads/main'
         run: |
+          $v = (Select-String -Path tiledo.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           gh release delete latest --yes 2>$null
           git push --delete origin latest 2>$null
           gh release create latest dist/TileDo.exe `
-            --title "TileDo (latest)" `
-            --notes "Always the most recent build. Download TileDo.exe and run directly — no install needed."
+            --title "TileDo v$v" `
+            --notes "Most recent build (v$v). Download TileDo.exe and run directly - no install needed. The app can also update itself from Settings."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

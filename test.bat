@@ -1,4 +1,4 @@
 @echo off
 echo Starting TileDo (test mode)...
-py tiledo.py
+py -3.12 tiledo.py
 pause
