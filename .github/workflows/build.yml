@@ -23,7 +23,7 @@ jobs:
         run: pip install pyqt5 pyinstaller
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name TileDo tiledo.py
+        run: pyinstaller --onefile --windowed --icon icon.ico --name TileDo tiledo.py
 
       # Every push to main → overwrite the rolling "latest" release.
       # The download link never changes, the exe is always current.

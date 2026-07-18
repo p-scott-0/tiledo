@@ -35,7 +35,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 GITHUB_REPO = "p-scott-0/tiledo"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,9 +536,10 @@ class StageChip(QToolButton):
     """Coloured-dot stage chip with an instant dropdown to switch stage."""
     changed = pyqtSignal()
 
-    def __init__(self, task, data, app=None):
+    def __init__(self, task, data, app=None, max_chars=None):
         super().__init__()
         self._task, self._data, self._app = task, data, app
+        self._max_chars = max_chars
         self.setPopupMode(QToolButton.InstantPopup)
         self.setCursor(Qt.PointingHandCursor)
         m = QMenu(self)
@@ -558,7 +559,11 @@ class StageChip(QToolButton):
 
     def _paint(self):
         s = stage_by_id(self._data, self._task.get("stage"))
-        self.setText(f"●  {s['name']}")
+        name = s["name"]
+        if self._max_chars and len(name) > self._max_chars:
+            name = name[:max(1, self._max_chars - 1)] + "…"
+        self.setToolTip(s["name"])
+        self.setText(f"●  {name}")
         self.setStyleSheet(
             f"QToolButton {{ background: {SURF2}; color: {TEXT}; border: 1px solid {BDR}; "
             f"border-radius: 4px; padding: 2px 8px; font-size: 8pt; }}"
@@ -596,10 +601,11 @@ class TaskCard(QFrame):
     open_requested = pyqtSignal(dict)
     drop_action    = pyqtSignal(str, str, str)     # src_id, target_id, mode
 
-    def __init__(self, task, data, app, allow_nest=True):
+    def __init__(self, task, data, app, allow_nest=True, card_w=230, card_h=150):
         super().__init__()
         self._task, self._data, self._app = task, data, app
         self._allow_nest = allow_nest
+        self._cw, self._ch = card_w, card_h
         self._press_pos = None
         self._dragging = False
         self.setAcceptDrops(True)
@@ -647,6 +653,9 @@ class TaskCard(QFrame):
 
         kids = children_of(self._data, self._task["id"])
         pend = [k for k in kids if not k.get("completed")]
+        wd = waiting_days(self._task)
+        # how much detail fits this card size
+        n_prev = 2 if self._ch >= 160 else (1 if self._ch >= 132 else 0)
         if kids:
             done = len(kids) - len(pend)
             pr = QHBoxLayout(); pr.setSpacing(6)
@@ -657,35 +666,37 @@ class TaskCard(QFrame):
             cnt.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
             pr.addWidget(cnt)
             v.addLayout(pr)
-            for k in pend[:2]:
-                s = stage_by_id(self._data, k.get("stage"))
+            for k in pend[:n_prev]:
                 lab = QLabel(f"·  {k['title']}")
                 lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
                 lab.setWordWrap(False)
                 v.addWidget(lab)
-            if len(pend) > 2:
-                more = QLabel(f"·  +{len(pend) - 2} more")
+            if n_prev and len(pend) > n_prev:
+                more = QLabel(f"·  +{len(pend) - n_prev} more")
                 more.setStyleSheet(f"color: {FAINT}; font-size: 8pt; background: transparent;")
                 v.addWidget(more)
-        else:
+        elif n_prev:
             note = (self._task.get("notes") or "").strip().splitlines()
             if note:
                 lab = QLabel(note[0][:90])
                 lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; font-style: italic; background: transparent;")
-                lab.setWordWrap(True)
+                lab.setWordWrap(n_prev > 1)
                 v.addWidget(lab)
 
         v.addStretch()
 
         bottom = QHBoxLayout(); bottom.setSpacing(5)
-        chip = StageChip(self._task, self._data, self._app)
+        avail = self._cw - 27                       # stripe + body margins
+        if wd is not None: avail -= 52
+        if kids: avail -= 38
+        chip = StageChip(self._task, self._data, self._app,
+                         max_chars=max(4, (avail - 30) // 6))
         chip.changed.connect(self._app.refresh)
         bottom.addWidget(chip)
-        wd = waiting_days(self._task)
         if wd is not None:
-            note = (self._task.get("waiting") or {}).get("note", "")
+            wnote = (self._task.get("waiting") or {}).get("note", "")
             wchip = QLabel(f"⏳ {wd}d")
-            wchip.setToolTip(f"Waiting on: {note}" if note else "Waiting")
+            wchip.setToolTip(f"Waiting on: {wnote}" if wnote else "Waiting")
             wchip.setStyleSheet(
                 "background: #2a2010; color: #ddaa30; border: 1px solid #665500; "
                 "border-radius: 4px; padding: 1px 6px; font-size: 8pt;")
@@ -940,6 +951,8 @@ class CardGrid(QScrollArea):
         self.mode, self.parent_id, self.recurring = mode, parent_id, recurring
         self._items = []          # (widget, kind) kind: card | header | label
         self._queued_chip = None
+        self._built_cw, self._built_ch = 230, 150
+        self._rebuild_scheduled = False
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setVerticalScrollBarPolicy(
@@ -954,6 +967,15 @@ class CardGrid(QScrollArea):
         super().resizeEvent(e)
         self._relayout()
 
+    def _card_dims(self):
+        vw = max(self.viewport().width(), 300)
+        m, g = 12, 10
+        base = max(150, self._cfg.get("tile_size", 230))
+        cols = max(1, (vw - 2 * m + g) // (base + g))
+        cw = (vw - 2 * m - g * (cols - 1)) // cols
+        ch = max(110, int(cw * 0.66))
+        return cols, cw, ch, m, g
+
     # ── data → widgets ───────────────────────────────────────────────────────
     def rebuild(self):
         for w, _ in self._items:
@@ -961,6 +983,7 @@ class CardGrid(QScrollArea):
         self._items = []
         if self._queued_chip:
             self._queued_chip.deleteLater(); self._queued_chip = None
+        _, self._built_cw, self._built_ch, _, _ = self._card_dims()
 
         if self.recurring:
             active = [t for t in self._data["tasks"]
@@ -994,7 +1017,9 @@ class CardGrid(QScrollArea):
         self._relayout()
 
     def _add_card(self, t, allow_nest=True):
-        c = TaskCard(t, self._data, self._app, allow_nest=allow_nest and not self.recurring)
+        c = TaskCard(t, self._data, self._app,
+                     allow_nest=allow_nest and not self.recurring,
+                     card_w=self._built_cw, card_h=self._built_ch)
         c.setParent(self._box)
         c.open_requested.connect(self._app.open_task)
         c.drop_action.connect(self._app.handle_drop)
@@ -1024,11 +1049,13 @@ class CardGrid(QScrollArea):
         vh = self.viewport().height()
         if vw < 80 or not self._items:
             return
-        m, g = 12, 10
-        base = max(150, self._cfg.get("tile_size", 230))
-        cols = max(1, (vw - 2 * m + g) // (base + g))
-        cw = (vw - 2 * m - g * (cols - 1)) // cols
-        ch = max(110, int(cw * 0.66))
+        cols, cw, ch, m, g = self._card_dims()
+        # card content was built for a different width class → rebuild denser/sparser
+        if (abs(cw - self._built_cw) > 30
+                and any(k == "card" for _, k in self._items)
+                and not self._rebuild_scheduled):
+            self._rebuild_scheduled = True
+            QTimer.singleShot(0, self._rebuild_now)
 
         y, col = m, 0
         hidden = 0
@@ -1071,6 +1098,10 @@ class CardGrid(QScrollArea):
             self._queued_chip.show()
         elif self._queued_chip:
             self._queued_chip.hide()
+
+    def _rebuild_now(self):
+        self._rebuild_scheduled = False
+        self.rebuild()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Breadcrumb — navigation trail; crumbs accept drops (move task up the tree)
@@ -2980,6 +3011,11 @@ class MainWindow(QMainWindow):
 
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    # Own AppUserModelID → Windows taskbar shows OUR icon, not Python's/PyInstaller's
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pscott.TileDo")
+    except Exception:
+        pass
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
