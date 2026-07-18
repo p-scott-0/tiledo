@@ -5,10 +5,16 @@ Design language follows factory-planner (github.com/p-scott-0/factory-planner):
 charcoal surfaces, amber accent, quiet borders, uppercase micro-labels.
 """
 
-import sys, os, re, json, uuid, base64, shutil, subprocess
+import sys, os, re, json, uuid, base64, copy, subprocess, ctypes
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 import urllib.request
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QDialog, QLabel,
@@ -16,18 +22,20 @@ from PyQt5.QtWidgets import (
     QScrollArea, QSizeGrip, QCheckBox, QSpinBox, QProgressBar,
     QColorDialog, QFileDialog, QStackedWidget, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect, QShortcut, QComboBox, QRadioButton, QButtonGroup,
-    QVBoxLayout, QHBoxLayout, QSizePolicy, QMessageBox,
+    QVBoxLayout, QHBoxLayout, QSizePolicy, QMessageBox, QSystemTrayIcon,
 )
 from PyQt5.QtCore import (
-    Qt, QPoint, QTimer, QThread, QMimeData, QEvent, QSharedMemory,
-    pyqtSignal, QBuffer, QIODevice, QRect,
+    Qt, QPoint, QTimer, QThread, QMimeData, QEvent,
+    pyqtSignal, QBuffer, QIODevice, QRect, QAbstractNativeEventFilter,
 )
 from PyQt5.QtGui import (
     QColor, QPalette, QDrag, QTextCursor, QTextCharFormat, QFont,
-    QTextListFormat, QKeySequence, QImage, QPixmap,
+    QTextListFormat, QKeySequence, QImage, QPixmap, QPainter, QIcon,
+    QTextTableFormat, QTextLength,
 )
+from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 GITHUB_REPO = "p-scott-0/tiledo"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +70,7 @@ DEFAULT_STAGES = [
 DEFAULT_CFG = {
     "tile_size": 230, "x": 100, "y": 60, "w": 1000, "h": 720,
     "auto_update": True, "ui_version": 2,
+    "close_to_tray": True, "hotkey_enabled": True,
     "priority_color": dict(DEFAULT_PRIO_COLOR),
 }
 
@@ -105,6 +114,7 @@ def mk_task(title, priority="medium", parent_id=None, recurring=False):
 def load_data():
     d = _read_json(DATA_FILE) or {}
     d.setdefault("tasks", [])
+    d.setdefault("templates", [])
     if not d.get("stages"):
         d["stages"] = [dict(s) for s in DEFAULT_STAGES]
 
@@ -260,6 +270,138 @@ def stage_by_id(d, sid):
             return s
     return {"id": sid, "name": "—", "color": FAINT}
 
+# ── archive ───────────────────────────────────────────────────────────────────
+ARCHIVE_FILE = DATA_DIR / "archive.json"
+
+def load_archive():
+    a = _read_json(ARCHIVE_FILE) or {}
+    a.setdefault("tasks", [])
+    return a
+
+def save_archive(a):
+    _atomic_write(ARCHIVE_FILE, a)
+
+def archive_task(d, tid):
+    """Move a task and its whole subtree from the working set into archive.json."""
+    root = task_by_id(d, tid)
+    if not root:
+        return
+    ids = descendant_ids(d, tid) | {tid}
+    moved = [t for t in d["tasks"] if t["id"] in ids]
+    d["tasks"] = [t for t in d["tasks"] if t["id"] not in ids]
+    root["parent_id"] = None
+    root["archived_at"] = datetime.now().isoformat()
+    a = load_archive()
+    a["tasks"].extend(moved)
+    save_archive(a)
+
+def _archive_subtree_ids(a, root_id):
+    kmap = {}
+    for t in a["tasks"]:
+        kmap.setdefault(t.get("parent_id"), []).append(t["id"])
+    ids, stack = {root_id}, [root_id]
+    while stack:
+        for k in kmap.get(stack.pop(), []):
+            if k not in ids:
+                ids.add(k); stack.append(k)
+    return ids
+
+def restore_archived(d, root_id):
+    a = load_archive()
+    ids = _archive_subtree_ids(a, root_id)
+    moved = [t for t in a["tasks"] if t["id"] in ids]
+    a["tasks"] = [t for t in a["tasks"] if t["id"] not in ids]
+    save_archive(a)
+    root = next((t for t in moved if t["id"] == root_id), None)
+    if root:
+        root.pop("archived_at", None)
+        b = bucket(d, None, root.get("priority", "medium"))
+        root["order"] = max((x.get("order", 0) for x in b), default=-10) + 10
+    d["tasks"].extend(moved)
+
+def delete_archived(root_id):
+    a = load_archive()
+    ids = _archive_subtree_ids(a, root_id)
+    a["tasks"] = [t for t in a["tasks"] if t["id"] not in ids]
+    save_archive(a)
+
+# ── templates ─────────────────────────────────────────────────────────────────
+def template_items_from(d, tid):
+    return [{"title": k["title"], "children": template_items_from(d, k["id"])}
+            for k in children_of(d, tid)]
+
+def instantiate_items(d, items, parent_id, priority="medium"):
+    for i, it in enumerate(items):
+        t = mk_task(it.get("title", "item"), priority, parent_id)
+        t["order"] = i * 10
+        d["tasks"].append(t)
+        instantiate_items(d, it.get("children") or [], t["id"], priority)
+
+def count_template_items(items):
+    return sum(1 + count_template_items(it.get("children") or []) for it in items)
+
+# ── waiting-on ────────────────────────────────────────────────────────────────
+def waiting_days(t):
+    w = t.get("waiting")
+    if not w or not w.get("since"):
+        return None
+    try:
+        return max(0, (datetime.now() - datetime.fromisoformat(w["since"])).days)
+    except Exception:
+        return None
+
+# ── start-with-Windows (HKCU Run key) ─────────────────────────────────────────
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+def _startup_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    py = Path(sys.executable)
+    pyw = py.with_name("pythonw.exe")
+    exe = pyw if pyw.exists() else py
+    return f'"{exe}" "{Path(__file__).resolve()}" --tray'
+
+def get_startup_enabled():
+    if not winreg:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, "TileDo")
+        return True
+    except OSError:
+        return False
+
+def set_startup(enabled):
+    if not winreg:
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            if enabled:
+                winreg.SetValueEx(k, "TileDo", 0, winreg.REG_SZ, _startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, "TileDo")
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+def make_app_icon():
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(ACC))
+    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    p.setPen(QColor("#141414"))
+    f = QFont("Segoe UI", 28, QFont.Bold)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, "T")
+    p.end()
+    return QIcon(pm)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Stylesheet
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,9 +536,9 @@ class StageChip(QToolButton):
     """Coloured-dot stage chip with an instant dropdown to switch stage."""
     changed = pyqtSignal()
 
-    def __init__(self, task, data):
+    def __init__(self, task, data, app=None):
         super().__init__()
-        self._task, self._data = task, data
+        self._task, self._data, self._app = task, data, app
         self.setPopupMode(QToolButton.InstantPopup)
         self.setCursor(Qt.PointingHandCursor)
         m = QMenu(self)
@@ -407,6 +549,8 @@ class StageChip(QToolButton):
         self._paint()
 
     def _pick(self, action):
+        if self._app is not None:
+            self._app.snapshot()
         self._task["stage"] = action.data()
         save_data(self._data)
         self._paint()
@@ -534,9 +678,18 @@ class TaskCard(QFrame):
         v.addStretch()
 
         bottom = QHBoxLayout(); bottom.setSpacing(5)
-        chip = StageChip(self._task, self._data)
+        chip = StageChip(self._task, self._data, self._app)
         chip.changed.connect(self._app.refresh)
         bottom.addWidget(chip)
+        wd = waiting_days(self._task)
+        if wd is not None:
+            note = (self._task.get("waiting") or {}).get("note", "")
+            wchip = QLabel(f"⏳ {wd}d")
+            wchip.setToolTip(f"Waiting on: {note}" if note else "Waiting")
+            wchip.setStyleSheet(
+                "background: #2a2010; color: #ddaa30; border: 1px solid #665500; "
+                "border-radius: 4px; padding: 1px 6px; font-size: 8pt;")
+            bottom.addWidget(wchip)
         bottom.addStretch()
         if kids:
             kc = QLabel(f"⊞ {len(pend)}")
@@ -554,25 +707,75 @@ class TaskCard(QFrame):
 
     # ── interactions ─────────────────────────────────────────────────────────
     def _complete(self, state):
+        self._app.snapshot()
         cascade_complete(self._data, self._task["id"], bool(state))
         save_data(self._data)
         self._app.refresh()
 
     def _menu(self):
+        rec = bool(self._task.get("recurring"))
         m = QMenu(self)
-        m.addAction("Open").triggered.connect(
-            lambda _=False: self.open_requested.emit(self._task))
-        m.addAction("Edit…").triggered.connect(self._edit)
-        m.addAction("Add subtask…").triggered.connect(self._add_sub)
-        m.addAction("Open in window").triggered.connect(
-            lambda _=False: self._app.open_task_window(self._task))
-        m.addSeparator()
+        if rec:
+            m.addAction("Edit…").triggered.connect(self._edit)
+        else:
+            m.addAction("Open").triggered.connect(
+                lambda _=False: self.open_requested.emit(self._task))
+            m.addAction("Edit…").triggered.connect(self._edit)
+            m.addAction("Add subtask…").triggered.connect(self._add_sub)
+            m.addAction("Open in window").triggered.connect(
+                lambda _=False: self._app.open_task_window(self._task))
+            m.addSeparator()
+            if self._task.get("waiting"):
+                m.addAction("Clear waiting").triggered.connect(self._clear_waiting)
+            else:
+                m.addAction("Mark waiting…").triggered.connect(self._mark_waiting)
         m.addAction("Skip to back").triggered.connect(self._skip)
         m.addAction("Swap with queued…").triggered.connect(self._swap)
+        if not rec:
+            m.addSeparator()
+            m.addAction("Save as template…").triggered.connect(self._save_template)
+            m.addAction("Archive").triggered.connect(self._archive)
         m.addSeparator()
-        act = m.addAction("Delete")
-        act.triggered.connect(self._delete)
+        m.addAction("Delete").triggered.connect(self._delete)
         m.exec_(self.mapToGlobal(self.rect().center()))
+
+    def _mark_waiting(self):
+        dlg = TextPromptDialog(self.window(), "Mark waiting",
+                               "What are you waiting on?", "")
+        if dlg.exec_() == QDialog.Accepted:
+            self._app.snapshot()
+            self._task["waiting"] = {"note": dlg.value(),
+                                     "since": datetime.now().isoformat()}
+            save_data(self._data)
+            self._app.refresh()
+
+    def _clear_waiting(self):
+        self._app.snapshot()
+        self._task.pop("waiting", None)
+        save_data(self._data)
+        self._app.refresh()
+
+    def _save_template(self):
+        dlg = TextPromptDialog(self.window(), "Save as template",
+                               "Template name", self._task["title"])
+        if dlg.exec_() == QDialog.Accepted and dlg.value():
+            items = template_items_from(self._data, self._task["id"])
+            if not items:
+                items = [{"title": self._task["title"], "children": []}]
+            self._data["templates"].append(
+                {"id": str(uuid.uuid4()), "name": dlg.value(), "items": items})
+            save_data(self._data)
+
+    def _archive(self):
+        n = len(descendant_ids(self._data, self._task["id"]))
+        msg = f"Archive “{self._task['title']}”"
+        if n: msg += f" and its {n} item{'s' if n != 1 else ''}"
+        dlg = ConfirmDialog(self.window(), msg + "? You can restore it later.", "Archive")
+        if dlg.exec_() == QDialog.Accepted:
+            self._app.snapshot(include_archive=True)
+            archive_task(self._data, self._task["id"])
+            save_data(self._data)
+            self._app.refresh()
 
     def _edit(self):
         TaskDetailDialog(self.window(), self._task, self._data, self._app).exec_()
@@ -582,6 +785,7 @@ class TaskCard(QFrame):
                       parent_id=self._task["id"]).exec_()
 
     def _skip(self):
+        self._app.snapshot()
         b = bucket(self._data, self._task.get("parent_id"),
                    self._task["priority"], bool(self._task.get("recurring")))
         mx = max((t.get("order", 0) for t in b), default=0)
@@ -597,6 +801,7 @@ class TaskCard(QFrame):
         msg = f"Delete “{self._task['title']}”"
         if n: msg += f" and its {n} subtask{'s' if n != 1 else ''}"
         if ConfirmDialog(self.window(), msg + "?").exec_() == QDialog.Accepted:
+            self._app.snapshot()
             cascade_delete(self._data, self._task["id"])
             save_data(self._data)
             self._app.refresh()
@@ -629,7 +834,10 @@ class TaskCard(QFrame):
     def mouseReleaseEvent(self, e):
         if (e.button() == Qt.LeftButton and self._press_pos is not None
                 and not self._dragging):
-            self.open_requested.emit(self._task)
+            if self._task.get("recurring"):
+                self._edit()          # recurring items have no subtree to drill into
+            else:
+                self.open_requested.emit(self._task)
         self._press_pos = None
 
     # ── drop target ──────────────────────────────────────────────────────────
@@ -1064,6 +1272,16 @@ class AddTaskDialog(BaseDialog):
             self.add(self._stage)
         else:
             self._stage = None
+        self._tpl = None
+        if not recurring and data.get("templates"):
+            self.add(micro_label("Template"))
+            self._tpl = QComboBox()
+            self._tpl.addItem("— none —", None)
+            for tp in data["templates"]:
+                self._tpl.addItem(
+                    f"{tp['name']}  ({count_template_items(tp.get('items', []))} items)",
+                    tp["id"])
+            self.add(self._tpl)
         self.add(micro_label("Notes (optional)"))
         self._notes = QTextEdit(); self._notes.setFixedHeight(64)
         self.add(self._notes); self.add_stretch()
@@ -1077,6 +1295,7 @@ class AddTaskDialog(BaseDialog):
     def _save(self):
         title = self._title.text().strip()
         if not title: return
+        self._app.snapshot()
         ch = self._grp.checkedButton()
         t = mk_task(title, ch.property("v") if ch else "medium", self._pid, self._rec)
         if self._stage: t["stage"] = self._stage.currentData()
@@ -1084,6 +1303,12 @@ class AddTaskDialog(BaseDialog):
         b = bucket(self._data, self._pid, t["priority"], self._rec)
         t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
         self._data["tasks"].append(t)
+        if self._tpl is not None and self._tpl.currentData():
+            tp = next((x for x in self._data["templates"]
+                       if x["id"] == self._tpl.currentData()), None)
+            if tp:
+                instantiate_items(self._data, tp.get("items", []),
+                                  t["id"], t["priority"])
         save_data(self._data)
         self._app.refresh()
         self.accept()
@@ -1091,7 +1316,7 @@ class AddTaskDialog(BaseDialog):
 
 class TaskDetailDialog(BaseDialog):
     def __init__(self, parent, task, data, app):
-        super().__init__(parent, "Edit task", 460, 470)
+        super().__init__(parent, "Edit task", 460, 540)
         self._task, self._data, self._app = task, data, app
         self.add(micro_label("Title"))
         self._title = QLineEdit(task["title"])
@@ -1105,9 +1330,16 @@ class TaskDetailDialog(BaseDialog):
             if s["id"] == task.get("stage"):
                 self._stage.setCurrentIndex(self._stage.count() - 1)
         self.add(self._stage)
+        self.add(micro_label("Waiting on  (leave blank if not waiting)"))
+        w = task.get("waiting") or {}
+        self._waiting = QLineEdit(w.get("note", ""))
+        wd = waiting_days(task)
+        if wd is not None:
+            self._waiting.setToolTip(f"Waiting for {wd} day{'s' if wd != 1 else ''}")
+        self.add(self._waiting)
         self.add(micro_label("Notes"))
         self._notes = QTextEdit(task.get("notes", ""))
-        self._notes.setMinimumHeight(110)
+        self._notes.setMinimumHeight(100)
         self.add(self._notes)
         row = QHBoxLayout()
         de = btn_danger("Delete"); de.clicked.connect(self._delete)
@@ -1118,12 +1350,20 @@ class TaskDetailDialog(BaseDialog):
         self._title.setFocus()
 
     def _save(self):
+        self._app.snapshot()
         t = self._title.text().strip()
         if t: self._task["title"] = t
         ch = self._grp.checkedButton()
         if ch: self._task["priority"] = ch.property("v")
         self._task["stage"] = self._stage.currentData()
         self._task["notes"] = self._notes.toPlainText()
+        wnote = self._waiting.text().strip()
+        old = self._task.get("waiting") or {}
+        if not wnote:
+            self._task.pop("waiting", None)
+        elif wnote != old.get("note"):
+            self._task["waiting"] = {"note": wnote,
+                                     "since": datetime.now().isoformat()}
         save_data(self._data)
         self._app.refresh()
         self.accept()
@@ -1133,6 +1373,7 @@ class TaskDetailDialog(BaseDialog):
         msg = f"Delete “{self._task['title']}”"
         if n: msg += f" and its {n} subtask{'s' if n != 1 else ''}"
         if ConfirmDialog(self, msg + "?").exec_() == QDialog.Accepted:
+            self._app.snapshot()
             cascade_delete(self._data, self._task["id"])
             save_data(self._data)
             self._app.refresh()
@@ -1174,6 +1415,7 @@ class SwapDialog(BaseDialog):
         self.add_lay(r)
 
     def _do(self, other):
+        self._app.snapshot()
         self._cur["order"], other["order"] = other.get("order", 0), self._cur.get("order", 0)
         save_data(self._data)
         self._app.refresh()
@@ -1184,9 +1426,13 @@ class SwapDialog(BaseDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 class AllTasksDialog(BaseDialog):
     def __init__(self, parent, data, app):
-        super().__init__(parent, "All tasks", 640, 640)
+        super().__init__(parent, "All tasks", 660, 640)
         self._data, self._app = data, app
-        clear = btn_quiet("Clear completed")
+        arc = btn_quiet("View archive")
+        arc.clicked.connect(lambda _=False: self._app._track(
+            ArchiveDialog(self, self._data, self._app)))
+        self.bar.center_slot.insertWidget(self.bar.center_slot.count() - 1, arc)
+        clear = btn_quiet("Archive completed")
         clear.clicked.connect(self._clear_done)
         self.bar.center_slot.insertWidget(self.bar.center_slot.count() - 1, clear)
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
@@ -1235,6 +1481,7 @@ class AllTasksDialog(BaseDialog):
         ck = QCheckBox(); ck.setChecked(t.get("completed", False))
 
         def tog(state, task=t):
+            self._app.snapshot()
             cascade_complete(self._data, task["id"], bool(state))
             save_data(self._data)
             self._app.refresh()
@@ -1263,12 +1510,98 @@ class AllTasksDialog(BaseDialog):
                       and t.get("parent_id") is None]
         if not done_roots:
             return
-        if ConfirmDialog(self, f"Remove {len(done_roots)} completed task(s) "
-                               f"and their subtasks?").exec_() == QDialog.Accepted:
+        if ConfirmDialog(self, f"Archive {len(done_roots)} completed task(s) "
+                               f"and their subtasks? You can restore them later.",
+                         "Archive").exec_() == QDialog.Accepted:
+            self._app.snapshot(include_archive=True)
             for t in done_roots:
-                cascade_delete(self._data, t["id"])
+                archive_task(self._data, t["id"])
             save_data(self._data)
             self._app.refresh()
+            self._render()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Archive browser — search, restore, delete forever
+# ══════════════════════════════════════════════════════════════════════════════
+class ArchiveDialog(BaseDialog):
+    def __init__(self, parent, data, app):
+        super().__init__(parent, "Archive", 620, 600)
+        self._data, self._app = data, app
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search archive…")
+        self._search.textChanged.connect(self._render)
+        self.add(self._search)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+        self._box = QWidget(); self._box.setStyleSheet("background: transparent;")
+        self._v = QVBoxLayout(self._box)
+        self._v.setContentsMargins(0, 2, 0, 2); self._v.setSpacing(4)
+        sc.setWidget(self._box)
+        self.add(sc)
+        self._render()
+
+    def _render(self):
+        while self._v.count():
+            it = self._v.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+        a = load_archive()
+        q = self._search.text().strip().lower()
+        roots = [t for t in a["tasks"] if t.get("archived_at")]
+        roots.sort(key=lambda t: t.get("archived_at", ""), reverse=True)
+        shown = 0
+        for r in roots:
+            ids = _archive_subtree_ids(a, r["id"])
+            if q:
+                sub = [t for t in a["tasks"] if t["id"] in ids]
+                hay = " ".join(t["title"].lower() + " " + (t.get("notes") or "").lower()
+                               for t in sub)
+                if q not in hay:
+                    continue
+            self._v.addWidget(self._row(r, len(ids) - 1))
+            shown += 1
+        if not shown:
+            e = QLabel("Archive is empty." if not q else f"No matches for “{q}”.")
+            e.setStyleSheet(f"color: {FAINT};")
+            e.setAlignment(Qt.AlignCenter)
+            self._v.addWidget(e)
+        self._v.addStretch()
+
+    def _row(self, r, n_children):
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 6px; }}"
+            f"QFrame:hover {{ border-color: {BDR_H}; }}")
+        rl = QHBoxLayout(row); rl.setContentsMargins(10, 6, 6, 6); rl.setSpacing(8)
+        col = QVBoxLayout(); col.setSpacing(1)
+        tl = QLabel(r["title"])
+        tf = tl.font(); tf.setBold(True); tl.setFont(tf)
+        tl.setStyleSheet("background: transparent;")
+        col.addWidget(tl)
+        when = (r.get("archived_at") or "")[:10]
+        sub = QLabel(f"{n_children} item{'s' if n_children != 1 else ''} · archived {when}")
+        sub.setStyleSheet(f"color: {FAINT}; font-size: 8pt; background: transparent;")
+        col.addWidget(sub)
+        rl.addLayout(col, 1)
+        rs = btn_quiet("Restore")
+        rs.clicked.connect(lambda _=False, rid=r["id"]: self._restore(rid))
+        rl.addWidget(rs)
+        de = btn_danger("Delete")
+        de.clicked.connect(lambda _=False, rid=r["id"], title=r["title"]: self._delete(rid, title))
+        rl.addWidget(de)
+        return row
+
+    def _restore(self, rid):
+        self._app.snapshot(include_archive=True)
+        restore_archived(self._data, rid)
+        save_data(self._data)
+        self._app.refresh()
+        self._render()
+
+    def _delete(self, rid, title):
+        if ConfirmDialog(self, f"Permanently delete “{title}” from the archive? "
+                               f"This cannot be undone later.").exec_() == QDialog.Accepted:
+            self._app.snapshot(include_archive=True)
+            delete_archived(rid)
             self._render()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1300,6 +1633,8 @@ class TaskWindow(BaseDialog):
             def handle_drop(self, s, t, m): outer._app.handle_drop(s, t, m)
             def handle_priority_drop(self, s, p): outer._app.handle_priority_drop(s, p)
             def open_task_window(self, task): outer._app.open_task_window(task)
+            def snapshot(self, **kw): outer._app.snapshot(**kw)
+            def _track(self, dlg): outer._app._track(dlg)
         return Proxy()
 
     def _open(self, task):
@@ -1322,6 +1657,7 @@ class TaskWindow(BaseDialog):
     def _quick_add(self):
         title = self._quick.text().strip()
         if not title: return
+        self._app.snapshot()
         t = mk_task(title, "medium", self._pid)
         b = bucket(self._data, self._pid, "medium")
         t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
@@ -1437,6 +1773,64 @@ class NotesEditor(QTextEdit):
         if self._handle:
             self._handle.deleteLater(); self._handle = None
 
+    def insert_ref_table(self, rows, cols):
+        fmt = QTextTableFormat()
+        fmt.setBorder(1)
+        fmt.setBorderBrush(QColor(BDR_H))
+        try:
+            fmt.setBorderCollapse(True)
+        except AttributeError:
+            pass
+        fmt.setCellPadding(5)
+        fmt.setCellSpacing(0)
+        fmt.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        self.textCursor().insertTable(rows, cols, fmt)
+
+    def contextMenuEvent(self, e):
+        m = self.createStandardContextMenu()
+        cur = self.cursorForPosition(e.pos())
+        table = cur.currentTable()
+        if table:
+            cell = table.cellAt(cur)
+            m.addSeparator()
+            m.addAction("Insert row below").triggered.connect(
+                lambda _=False: table.insertRows(cell.row() + 1, 1))
+            m.addAction("Insert column right").triggered.connect(
+                lambda _=False: table.insertColumns(cell.column() + 1, 1))
+            m.addAction("Delete row").triggered.connect(
+                lambda _=False: table.removeRows(cell.row(), 1))
+            m.addAction("Delete column").triggered.connect(
+                lambda _=False: table.removeColumns(cell.column(), 1))
+        m.exec_(e.globalPos())
+
+
+class TableDialog(BaseDialog):
+    def __init__(self, parent):
+        super().__init__(parent, "Insert table", 320, 200)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Rows:"))
+        self._rows = QSpinBox(); self._rows.setRange(1, 30); self._rows.setValue(3)
+        row.addWidget(self._rows)
+        row.addSpacing(14)
+        row.addWidget(QLabel("Columns:"))
+        self._cols = QSpinBox(); self._cols.setRange(1, 12); self._cols.setValue(3)
+        row.addWidget(self._cols)
+        row.addStretch()
+        self.add_lay(row)
+        hint = QLabel("Right-click inside a table to add or remove rows and columns.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
+        self.add(hint)
+        self.add_stretch()
+        br = QHBoxLayout()
+        ok = btn_primary("Insert"); ok.clicked.connect(self.accept)
+        no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(no); br.addWidget(ok)
+        self.add_lay(br)
+
+    def dims(self):
+        return self._rows.value(), self._cols.value()
+
 
 class NotesView(QWidget):
     def __init__(self, notes, app):
@@ -1487,6 +1881,7 @@ class NotesView(QWidget):
             ("I",  "Italic  (Ctrl+I)", self._italic),
             ("U",  "Underline", self._underline),
             ("•",  "Bullet list", self._bullet),
+            ("▦",  "Insert table", self._table),
             ("🖼", "Insert image (or just paste one)", self._image),
             ("Aa", "Normal text", self._normal),
         ):
@@ -1638,6 +2033,12 @@ class NotesView(QWidget):
     def _bullet(self):
         self._editor.textCursor().insertList(QTextListFormat.ListDisc)
 
+    def _table(self):
+        dlg = TableDialog(self.window())
+        if dlg.exec_() == QDialog.Accepted:
+            r, c = dlg.dims()
+            self._editor.insert_ref_table(r, c)
+
     def _normal(self):
         f = QTextCharFormat()
         f.setFontPointSize(10); f.setFontWeight(QFont.Normal)
@@ -1786,6 +2187,46 @@ class SettingsDialog(BaseDialog):
         v.addLayout(gr)
 
         v.addWidget(sep_line())
+        v.addWidget(micro_label("Behaviour"))
+        self._tray_ck = QCheckBox("Close button hides to the system tray")
+        self._tray_ck.setChecked(self._cfg.get("close_to_tray", True))
+        v.addWidget(self._tray_ck)
+        self._startup_ck = QCheckBox("Start with Windows (opens in tray)")
+        self._startup_ck.setChecked(get_startup_enabled())
+        v.addWidget(self._startup_ck)
+        hk_text = "Global quick-capture hotkey  (Ctrl+Alt+T)"
+        if not getattr(self._app, "hotkey_ok", True):
+            hk_text += "  — unavailable, another app owns it"
+        self._hk_ck = QCheckBox(hk_text)
+        self._hk_ck.setChecked(self._cfg.get("hotkey_enabled", True))
+        v.addWidget(self._hk_ck)
+
+        v.addWidget(sep_line())
+        v.addWidget(micro_label("Templates"))
+        self._tpl_rows = []
+        if self._data.get("templates"):
+            for tp in self._data["templates"]:
+                r = QWidget(); rl = QHBoxLayout(r)
+                rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(6)
+                lab = QLabel(f"{tp['name']}  ·  {count_template_items(tp.get('items', []))} items")
+                lab.setStyleSheet("background: transparent;")
+                rl.addWidget(lab, 1)
+                de = btn_icon("✕", "Delete template", 24)
+                entry = {"id": tp["id"], "row": r, "deleted": False}
+
+                def kill(_=False, en=entry):
+                    en["deleted"] = True
+                    en["row"].hide()
+                de.clicked.connect(kill)
+                rl.addWidget(de)
+                v.addWidget(r)
+                self._tpl_rows.append(entry)
+        else:
+            hint = QLabel("None yet — use “Save as template…” on a task card.")
+            hint.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
+            v.addWidget(hint)
+
+        v.addWidget(sep_line())
         v.addWidget(micro_label("Priority colours"))
         self._prio_holders = {}
         for p in ("high", "medium", "low"):
@@ -1908,12 +2349,19 @@ class SettingsDialog(BaseDialog):
         self._upd_status.setText("Restarting to apply update…")
         apply_update_and_restart(path)
         self.accept()
-        self._app.close()
+        self._app.really_quit()
 
     # ── save ─────────────────────────────────────────────────────────────────
     def _save(self):
         self._cfg["tile_size"] = self._ts.value()
         self._cfg["auto_update"] = self._auto_ck.isChecked()
+        self._cfg["close_to_tray"] = self._tray_ck.isChecked()
+        self._cfg["hotkey_enabled"] = self._hk_ck.isChecked()
+        set_startup(self._startup_ck.isChecked())
+        removed_tpl = {e["id"] for e in self._tpl_rows if e["deleted"]}
+        if removed_tpl:
+            self._data["templates"] = [t for t in self._data["templates"]
+                                       if t["id"] not in removed_tpl]
         for p, holder in self._prio_holders.items():
             PRIO_COLOR[p] = holder[0]
 
@@ -1937,8 +2385,80 @@ class SettingsDialog(BaseDialog):
 
         save_data(self._data)
         save_cfg(self._cfg)
+        self._app.apply_hotkey()
         self._app.refresh()
         self.accept()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Global hotkey (Ctrl+Alt+T) + quick-capture popup
+# ══════════════════════════════════════════════════════════════════════════════
+WM_HOTKEY = 0x0312
+HOTKEY_ID = 0xA117
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    def __init__(self, cb):
+        super().__init__()
+        self._cb = cb
+
+    def nativeEventFilter(self, etype, message):
+        if etype in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                self._cb()
+                return True, 0
+        return False, 0
+
+
+class QuickCaptureDialog(QDialog):
+    def __init__(self, app):
+        super().__init__(None)
+        self._app = app
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.resize(440, 120)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        frame = QFrame(); frame.setObjectName("qc")
+        frame.setStyleSheet(
+            f"#qc {{ background: {BG}; border: 1px solid {ACC}; border-radius: 10px; }}")
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(26); sh.setColor(QColor(0, 0, 0, 200)); sh.setOffset(0, 4)
+        frame.setGraphicsEffect(sh)
+        outer.addWidget(frame)
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(14, 10, 14, 10); v.setSpacing(6)
+        v.addWidget(micro_label("Quick capture", ACC))
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText("New task…")
+        ef = self._edit.font(); ef.setPointSize(11); self._edit.setFont(ef)
+        self._edit.returnPressed.connect(self._add)
+        v.addWidget(self._edit)
+        hint = QLabel("Enter to add — keep typing to add more · Esc to close")
+        hint.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
+        v.addWidget(hint)
+        s = QApplication.primaryScreen().availableGeometry()
+        self.move(s.center().x() - self.width() // 2,
+                  s.top() + int(s.height() * 0.26))
+
+    def _add(self):
+        title = self._edit.text().strip()
+        if not title:
+            self.close(); return
+        self._app.snapshot()
+        t = mk_task(title, "medium", None)
+        b = bucket(self._app.data, None, "medium")
+        t["order"] = max((x.get("order", 0) for x in b), default=-10) + 10
+        self._app.data["tasks"].append(t)
+        save_data(self._app.data)
+        self._app.refresh()
+        self._edit.clear()
+        self._edit.setPlaceholderText("Added ✓  — next task…")
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main window
@@ -1952,15 +2472,110 @@ class MainWindow(QMainWindow):
         self.pending_update = None
         self._parent_id = None
         self._children = []           # tracked non-modal windows
+        self._undo_stack = []
+        self._quitting = False
+        self._tray = None
+        self._tray_notified = False
+        self._qc = None
+        self.hotkey_ok = True
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(480, 360)
         self._restore_geometry()
         self._build()
+        self._init_tray()
+        self.apply_hotkey()
         self.update_meta()
         if self.cfg.get("auto_update", True):
             QTimer.singleShot(4000, self._auto_check)
+
+    # ── undo ─────────────────────────────────────────────────────────────────
+    def snapshot(self, include_archive=False):
+        """Push a restore point before a mutating operation (Ctrl+Z pops it)."""
+        entry = {"tasks": copy.deepcopy(self.data["tasks"])}
+        if include_archive:
+            entry["archive"] = copy.deepcopy(load_archive())
+        self._undo_stack.append(entry)
+        del self._undo_stack[:-30]
+
+    def _undo(self):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, (QTextEdit, QLineEdit)):
+            fw.undo()               # text fields keep their native undo
+            return
+        if not self._undo_stack:
+            return
+        entry = self._undo_stack.pop()
+        self.data["tasks"] = entry["tasks"]
+        save_data(self.data)
+        if entry.get("archive") is not None:
+            save_archive(entry["archive"])
+        self.refresh()
+
+    # ── tray / hotkey ────────────────────────────────────────────────────────
+    def _init_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray = QSystemTrayIcon(make_app_icon(), self)
+        self._tray_menu = QMenu()
+        self._tray_menu.addAction("Open TileDo").triggered.connect(self.show_from_tray)
+        self._tray_menu.addAction("Quick capture\tCtrl+Alt+T").triggered.connect(
+            self.show_quick_capture)
+        self._tray_menu.addSeparator()
+        self._tray_menu.addAction("Quit").triggered.connect(self.really_quit)
+        self._tray.setContextMenu(self._tray_menu)
+        self._tray.setToolTip("TileDo")
+        self._tray.activated.connect(self._tray_activated)
+        self._tray.show()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def show_quick_capture(self):
+        if self._qc is not None and self._qc.isVisible():
+            self._qc.raise_(); self._qc.activateWindow()
+            self._qc._edit.setFocus()
+            return
+        self._qc = QuickCaptureDialog(self)
+        self._qc.show(); self._qc.raise_(); self._qc.activateWindow()
+        self._qc._edit.setFocus()
+
+    def apply_hotkey(self):
+        self._unregister_hotkey()
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return
+        if not self.cfg.get("hotkey_enabled", True):
+            return
+        try:
+            MOD_ALT, MOD_CONTROL = 0x1, 0x2
+            ok = ctypes.windll.user32.RegisterHotKey(
+                None, HOTKEY_ID, MOD_ALT | MOD_CONTROL, ord("T"))
+            self.hotkey_ok = bool(ok)
+            if ok and not getattr(self, "_hk_filter", None):
+                self._hk_filter = HotkeyFilter(self.show_quick_capture)
+                QApplication.instance().installNativeEventFilter(self._hk_filter)
+        except Exception:
+            self.hotkey_ok = False
+
+    def _unregister_hotkey(self):
+        try:
+            ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
+        except Exception:
+            pass
+
+    def really_quit(self):
+        self._quitting = True
+        self.close()
+        QApplication.quit()
 
     # ── geometry ─────────────────────────────────────────────────────────────
     def _restore_geometry(self):
@@ -2090,6 +2705,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self,
                   activated=lambda: (self._searchbox.setFocus(), self._searchbox.selectAll()))
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self._add_clicked)
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._undo)
         QShortcut(QKeySequence("Escape"), self, activated=self._escape)
 
         self.switch_tab("tasks")
@@ -2142,6 +2758,7 @@ class MainWindow(QMainWindow):
         if parent_id is not None and (parent_id == src_id
                 or parent_id in descendant_ids(self.data, src_id)):
             return
+        self.snapshot()
         src["parent_id"] = parent_id
         b = bucket(self.data, parent_id, src["priority"])
         if src not in b: b.append(src)
@@ -2157,6 +2774,7 @@ class MainWindow(QMainWindow):
             return
         if target_id in descendant_ids(self.data, src_id):
             return
+        self.snapshot()
         if mode == "nest":
             nest_under(self.data, src, tgt)
         else:
@@ -2167,6 +2785,7 @@ class MainWindow(QMainWindow):
     def handle_priority_drop(self, src_id, priority):
         src = task_by_id(self.data, src_id)
         if not src: return
+        self.snapshot()
         src["priority"] = priority
         src["parent_id"] = self._parent_id
         b = bucket(self.data, self._parent_id, priority)
@@ -2179,6 +2798,7 @@ class MainWindow(QMainWindow):
     def _quick_add(self):
         title = self._quick.text().strip()
         if not title: return
+        self.snapshot()
         t = mk_task(title, "medium", self._parent_id)
         b = bucket(self.data, self._parent_id, "medium")
         t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
@@ -2190,6 +2810,7 @@ class MainWindow(QMainWindow):
     def _quick_add_rec(self):
         title = self._rquick.text().strip()
         if not title: return
+        self.snapshot()
         t = mk_task(title, "medium", None, recurring=True)
         b = bucket(self.data, None, "medium", recurring=True)
         t["order"] = (max((x.get("order", 0) for x in b), default=-10)) + 10
@@ -2199,13 +2820,16 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _reset_recurring(self):
-        changed = False
+        changed = any(t.get("recurring") and t.get("completed")
+                      for t in self.data["tasks"])
+        if not changed:
+            return
+        self.snapshot()
         for t in self.data["tasks"]:
             if t.get("recurring") and t.get("completed"):
-                t["completed"] = False; changed = True
-        if changed:
-            save_data(self.data)
-            self.refresh()
+                t["completed"] = False
+        save_data(self.data)
+        self.refresh()
 
     def _add_clicked(self):
         if self._stack.currentIndex() == 1:
@@ -2277,6 +2901,7 @@ class MainWindow(QMainWindow):
 
             def untick(state, task=t):
                 if not state:
+                    self.snapshot()
                     task["completed"] = False
                     save_data(self.data)
                     self.refresh()
@@ -2334,10 +2959,24 @@ class MainWindow(QMainWindow):
         g = self.normalGeometry() if self.isMaximized() else self.geometry()
         self.cfg.update({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height()})
         save_cfg(self.cfg)
+        if (self._tray is not None and self.cfg.get("close_to_tray", True)
+                and not self._quitting):
+            e.ignore()
+            self.hide()
+            if not self._tray_notified:
+                self._tray.showMessage(
+                    "TileDo", "Still running here — click to reopen.",
+                    QSystemTrayIcon.Information, 2500)
+                self._tray_notified = True
+            return
         for w in self._children:
             try: w.close()
             except Exception: pass
+        self._unregister_hotkey()
+        if self._tray is not None:
+            self._tray.hide()
         e.accept()
+        QApplication.quit()
 
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -2359,16 +2998,38 @@ def main():
     pal.setColor(QPalette.HighlightedText, QColor("#141414"))
     app.setPalette(pal)
 
-    # one instance only — a second copy silently corrupting data.json was possible in v1
-    guard = QSharedMemory("tiledo-single-instance")
-    if not guard.create(1):
-        QMessageBox.information(None, "TileDo", "TileDo is already running.")
+    app.setWindowIcon(make_app_icon())
+    app.setQuitOnLastWindowClosed(False)   # tray keeps us alive; quit is explicit
+
+    # Single instance: if TileDo is already running, tell it to show itself and exit.
+    IPC = "tiledo-ipc"
+    probe = QLocalSocket()
+    probe.connectToServer(IPC)
+    if probe.waitForConnected(400):
+        probe.write(b"show"); probe.flush()
+        probe.waitForBytesWritten(400)
+        probe.disconnectFromServer()
         return 0
+    QLocalServer.removeServer(IPC)         # clear stale socket after a crash
 
     win = MainWindow()
-    win.show()
+
+    server = QLocalServer()
+    server.listen(IPC)
+
+    def _on_ipc():
+        while server.hasPendingConnections():
+            conn = server.nextPendingConnection()
+            conn.readyRead.connect(lambda c=conn: (c.readAll(), win.show_from_tray()))
+            conn.disconnected.connect(conn.deleteLater)
+    server.newConnection.connect(_on_ipc)
+
+    if "--tray" in sys.argv and win._tray is not None:
+        pass                                # start hidden in the tray
+    else:
+        win.show()
     rc = app.exec_()
-    del guard
+    server.close()
     return rc
 
 
