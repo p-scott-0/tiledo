@@ -35,7 +35,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 GITHUB_REPO = "p-scott-0/tiledo"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -141,6 +141,14 @@ def load_data():
             t["parent_id"] = None          # orphan → surface at root so it isn't lost
         elif "parent_id" not in t:
             t["parent_id"] = None
+    # waiting ⇒ blocked: data saved before the pairing existed may disagree
+    bid = blocked_stage_id(d)
+    if bid:
+        for t in d["tasks"]:
+            w = t.get("waiting")
+            if w and t.get("stage") != bid:
+                w["prev_stage"] = t.get("stage")
+                t["stage"] = bid
     return d
 
 def save_data(d):
@@ -186,7 +194,8 @@ def children_of(d, pid, include_done=True):
             if t.get("parent_id") == pid and not t.get("recurring")]
     if not include_done:
         kids = [t for t in kids if not t.get("completed")]
-    kids.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), t.get("order", 0)))
+    rank = stage_ranker(d)
+    kids.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), rank(t), t.get("order", 0)))
     return kids
 
 def descendant_ids(d, tid):
@@ -225,13 +234,16 @@ def cascade_delete(d, tid):
     d["tasks"] = [t for t in d["tasks"] if t["id"] not in doomed]
 
 def bucket(d, parent_id, priority, recurring=False):
-    """Pending siblings sharing parent + priority — the reorder unit."""
+    """Pending siblings sharing parent + priority — the reorder unit.
+    Sorted in display order: in-progress first, blocked/waiting last, manual
+    order within each group — so renumbering after a drag keeps the groups."""
     ts = [t for t in d["tasks"]
           if bool(t.get("recurring")) == recurring
           and not t.get("completed")
           and t.get("parent_id") == parent_id
           and (recurring or t.get("priority") == priority)]
-    ts.sort(key=lambda t: t.get("order", 0))
+    rank = stage_ranker(d)
+    ts.sort(key=lambda t: (rank(t), t.get("order", 0)))
     return ts
 
 def renumber(ts):
@@ -340,7 +352,7 @@ def instantiate_items(d, items, parent_id, priority="medium"):
 def count_template_items(items):
     return sum(1 + count_template_items(it.get("children") or []) for it in items)
 
-# ── waiting-on ────────────────────────────────────────────────────────────────
+# ── waiting-on / blocked (paired: waiting ⇒ blocked, leaving blocked clears) ──
 def waiting_days(t):
     w = t.get("waiting")
     if not w or not w.get("since"):
@@ -349,6 +361,61 @@ def waiting_days(t):
         return max(0, (datetime.now() - datetime.fromisoformat(w["since"])).days)
     except Exception:
         return None
+
+def _stage_with(d, sid, word):
+    """Stages are user-editable, so match by the stock id first, then by name."""
+    stages = d.get("stages", [])
+    for s in stages:
+        if s["id"] == sid:
+            return s["id"]
+    for s in stages:
+        if word in s["name"].lower():
+            return s["id"]
+    return None
+
+def blocked_stage_id(d):
+    return _stage_with(d, "blocked", "block")
+
+def progress_stage_id(d):
+    return _stage_with(d, "in_progress", "progress")
+
+def is_blocked(d, t):
+    bid = blocked_stage_id(d)
+    return bool(t.get("waiting")) or (bid is not None and t.get("stage") == bid)
+
+def stage_ranker(d):
+    """Display order within a priority: 0 in progress · 1 everything else · 2 blocked/waiting."""
+    bid, pid = blocked_stage_id(d), progress_stage_id(d)
+
+    def rank(t):
+        if t.get("waiting") or (bid is not None and t.get("stage") == bid):
+            return 2
+        if pid is not None and t.get("stage") == pid:
+            return 0
+        return 1
+    return rank
+
+def set_waiting(d, t, note):
+    old = t.get("waiting") or {}
+    w = {"note": note,
+         "since": old["since"] if old.get("since") and note == old.get("note")
+         else datetime.now().isoformat()}
+    if old.get("prev_stage"):
+        w["prev_stage"] = old["prev_stage"]
+    bid = blocked_stage_id(d)
+    if bid and t.get("stage") != bid:
+        w["prev_stage"] = t.get("stage")
+        t["stage"] = bid
+    t["waiting"] = w
+
+def clear_waiting(d, t):
+    """Drop the wait; if the wait is what blocked it, go back to the stage it had."""
+    w = t.pop("waiting", None) or {}
+    bid = blocked_stage_id(d)
+    prev = w.get("prev_stage")
+    valid = {s["id"] for s in d.get("stages", [])}
+    if bid and t.get("stage") == bid and prev in valid and prev != bid:
+        t["stage"] = prev
 
 # ── start-with-Windows (HKCU Run key) ─────────────────────────────────────────
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -552,7 +619,16 @@ class StageChip(QToolButton):
     def _pick(self, action):
         if self._app is not None:
             self._app.snapshot()
-        self._task["stage"] = action.data()
+        new = action.data()
+        bid = blocked_stage_id(self._data)
+        if bid and new != bid and self._task.get("stage") == bid:
+            self._task.pop("waiting", None)        # leaving Blocked ends the wait
+        self._task["stage"] = new
+        if bid and new == bid and not self._task.get("waiting") and self._app is not None:
+            dlg = TextPromptDialog(self.window(), "Blocked",
+                                   "What's blocking it?  (optional)", "")
+            if dlg.exec_() == QDialog.Accepted and dlg.value():
+                set_waiting(self._data, self._task, dlg.value())
         save_data(self._data)
         self._paint()
         self.changed.emit()
@@ -596,29 +672,111 @@ class TinyProgress(QWidget):
 # Task card — drag source + drop target
 # ══════════════════════════════════════════════════════════════════════════════
 MIME = "application/x-tiledo-task"
+ROW_H = 34          # compact list-row height
 
 class TaskCard(QFrame):
     open_requested = pyqtSignal(dict)
     drop_action    = pyqtSignal(str, str, str)     # src_id, target_id, mode
 
-    def __init__(self, task, data, app, allow_nest=True, card_w=230, card_h=150):
+    def __init__(self, task, data, app, allow_nest=True, card_w=230, card_h=150,
+                 compact=False, grid=None):
         super().__init__()
         self._task, self._data, self._app = task, data, app
         self._allow_nest = allow_nest
         self._cw, self._ch = card_w, card_h
+        self.compact = compact
+        self._grid = grid                 # CardGrid hosting us (gap + hide while dragging)
         self._press_pos = None
         self._dragging = False
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
-        self._build()
+        self.setObjectName("card")
+        self._base_style()
+        if compact:
+            self._build_compact()
+        else:
+            self._build()
+
+    def _base_style(self, nest_hover=False):
+        r = 6 if self.compact else 8
+        if nest_hover:
+            self.setStyleSheet(
+                f"#card {{ background: {SURF_H}; border: 1.5px solid {ACC}; border-radius: {r}px; }}")
+        else:
+            self.setStyleSheet(
+                f"#card {{ background: {SURF}; border: 1px solid {BDR}; border-radius: {r}px; }}"
+                f"#card:hover {{ background: {SURF_H}; border-color: {BDR_H}; }}")
+
+    def _reason(self):
+        return ((self._task.get("waiting") or {}).get("note") or "").strip()
+
+    def _waiting_chip(self, wd):
+        wchip = QLabel(f"⏳ {wd}d")
+        wchip.setToolTip(f"Waiting on: {self._reason()}" if self._reason() else "Waiting")
+        wchip.setStyleSheet(
+            "background: #2a2010; color: #ddaa30; border: 1px solid #665500; "
+            "border-radius: 4px; padding: 1px 6px; font-size: 8pt;")
+        return wchip
+
+    # ── compact row (parent set to list view) ────────────────────────────────
+    def _build_compact(self):
+        pc = PRIO_COLOR.get(self._task["priority"], DIM)
+        blocked = is_blocked(self._data, self._task)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        stripe = QFrame(); stripe.setFixedWidth(3)
+        stripe.setStyleSheet(
+            f"background: {pc}; border-top-left-radius: 6px; "
+            f"border-bottom-left-radius: 6px; border: none;")
+        outer.addWidget(stripe)
+        body = QWidget(); body.setStyleSheet("background: transparent;")
+        h = QHBoxLayout(body); h.setContentsMargins(9, 0, 5, 0); h.setSpacing(8)
+
+        ck = QCheckBox()
+        ck.setChecked(self._task.get("completed", False))
+        ck.setToolTip("Complete (includes subtasks)")
+        ck.stateChanged.connect(self._complete)
+        h.addWidget(ck)
+        title = QLabel(self._task["title"])
+        title.setToolTip(self._task["title"])
+        title.setStyleSheet(f"color: {DIM if blocked else TEXT}; font-weight: 600; background: transparent;")
+        title.setMaximumWidth(max(120, int(self._cw * 0.48)))
+        h.addWidget(title)
+
+        kids = children_of(self._data, self._task["id"])
+        pend = [k for k in kids if not k.get("completed")]
+        reason = self._reason()
+        sub, col = "", FAINT
+        if blocked and reason:
+            sub, col = f"⏳ {reason}", "#ddaa30"
+        elif kids:
+            sub = f"⊞ {len(kids) - len(pend)}/{len(kids)} done"
+        else:
+            note = (self._task.get("notes") or "").strip().splitlines()
+            if note:
+                sub = note[0][:90]
+        if sub:
+            sl = QLabel(sub)
+            sl.setToolTip(sub)
+            sl.setStyleSheet(f"color: {col}; font-size: 8pt; background: transparent;")
+            h.addWidget(sl, 1)
+        else:
+            h.addStretch(1)
+        wd = waiting_days(self._task)
+        if wd is not None:
+            h.addWidget(self._waiting_chip(wd))
+        chip = StageChip(self._task, self._data, self._app, max_chars=14)
+        chip.changed.connect(self._app.refresh)
+        h.addWidget(chip)
+        menu_b = btn_icon("⋯", "Actions  (or right-click)", 24)
+        menu_b.clicked.connect(lambda _=False: self._menu())
+        h.addWidget(menu_b)
+        outer.addWidget(body, 1)
 
     # ── content ──────────────────────────────────────────────────────────────
     def _build(self):
         pc = PRIO_COLOR.get(self._task["priority"], DIM)
-        self.setObjectName("card")
-        self.setStyleSheet(
-            f"#card {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 8px; }}"
-            f"#card:hover {{ background: {SURF_H}; border-color: {BDR_H}; }}")
+        blocked = is_blocked(self._data, self._task)
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
@@ -636,12 +794,12 @@ class TaskCard(QFrame):
         title = QLabel(self._task["title"])
         title.setWordWrap(True)
         tf = title.font(); tf.setPointSize(10); tf.setBold(True); title.setFont(tf)
-        title.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        title.setStyleSheet(f"color: {DIM if blocked else TEXT}; background: transparent;")
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         top.addWidget(title, 1)
 
-        menu_b = btn_icon("⋯", "Actions", 24)
-        menu_b.clicked.connect(self._menu)
+        menu_b = btn_icon("⋯", "Actions  (or right-click)", 24)
+        menu_b.clicked.connect(lambda _=False: self._menu())
         top.addWidget(menu_b, 0, Qt.AlignTop)
 
         ck = QCheckBox()
@@ -654,18 +812,18 @@ class TaskCard(QFrame):
         kids = children_of(self._data, self._task["id"])
         pend = [k for k in kids if not k.get("completed")]
         wd = waiting_days(self._task)
-        # how much detail fits this card size
-        n_prev = 2 if self._ch >= 160 else (1 if self._ch >= 132 else 0)
+        reason = self._reason()
+        # subtext budget: 8pt lines that fit between the title and the footer
+        n_prev = 3 if self._ch >= 175 else (2 if self._ch >= 140 else (1 if self._ch >= 118 else 0))
+        if blocked and reason and n_prev:
+            lab = QLabel(f"⏳ {reason}")
+            lab.setToolTip(reason)
+            lab.setStyleSheet("color: #ddaa30; font-size: 8pt; background: transparent;")
+            lab.setWordWrap(n_prev > 1)
+            lab.setMaximumHeight(30 if n_prev > 1 else 15)
+            v.addWidget(lab)
+            n_prev -= 2 if n_prev > 1 else 1
         if kids:
-            done = len(kids) - len(pend)
-            pr = QHBoxLayout(); pr.setSpacing(6)
-            bar = TinyProgress(done, len(kids))
-            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            pr.addWidget(bar, 1)
-            cnt = QLabel(f"{done}/{len(kids)}")
-            cnt.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
-            pr.addWidget(cnt)
-            v.addLayout(pr)
             for k in pend[:n_prev]:
                 lab = QLabel(f"·  {k['title']}")
                 lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
@@ -681,9 +839,21 @@ class TaskCard(QFrame):
                 lab = QLabel(note[0][:90])
                 lab.setStyleSheet(f"color: {DIM}; font-size: 8pt; font-style: italic; background: transparent;")
                 lab.setWordWrap(n_prev > 1)
+                lab.setMaximumHeight(30 if n_prev > 1 else 15)
                 v.addWidget(lab)
 
         v.addStretch()
+
+        if kids:                                    # progress sits at the foot of the tile
+            done = len(kids) - len(pend)
+            pr = QHBoxLayout(); pr.setSpacing(6)
+            bar = TinyProgress(done, len(kids))
+            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            pr.addWidget(bar, 1)
+            cnt = QLabel(f"{done}/{len(kids)}")
+            cnt.setStyleSheet(f"color: {DIM}; font-size: 8pt; background: transparent;")
+            pr.addWidget(cnt)
+            v.addLayout(pr)
 
         bottom = QHBoxLayout(); bottom.setSpacing(5)
         avail = self._cw - 27                       # stripe + body margins
@@ -694,13 +864,7 @@ class TaskCard(QFrame):
         chip.changed.connect(self._app.refresh)
         bottom.addWidget(chip)
         if wd is not None:
-            wnote = (self._task.get("waiting") or {}).get("note", "")
-            wchip = QLabel(f"⏳ {wd}d")
-            wchip.setToolTip(f"Waiting on: {wnote}" if wnote else "Waiting")
-            wchip.setStyleSheet(
-                "background: #2a2010; color: #ddaa30; border: 1px solid #665500; "
-                "border-radius: 4px; padding: 1px 6px; font-size: 8pt;")
-            bottom.addWidget(wchip)
+            bottom.addWidget(self._waiting_chip(wd))
         bottom.addStretch()
         if kids:
             kc = QLabel(f"⊞ {len(pend)}")
@@ -710,12 +874,6 @@ class TaskCard(QFrame):
         v.addLayout(bottom)
         outer.addWidget(body, 1)
 
-        # drop indicators (hidden until a drag hovers)
-        self._ind_l = QFrame(self); self._ind_r = QFrame(self)
-        for f in (self._ind_l, self._ind_r):
-            f.setStyleSheet(f"background: {ACC}; border-radius: 2px;")
-            f.hide()
-
     # ── interactions ─────────────────────────────────────────────────────────
     def _complete(self, state):
         self._app.snapshot()
@@ -723,7 +881,7 @@ class TaskCard(QFrame):
         save_data(self._data)
         self._app.refresh()
 
-    def _menu(self):
+    def _menu(self, pos=None):
         rec = bool(self._task.get("recurring"))
         m = QMenu(self)
         if rec:
@@ -735,34 +893,61 @@ class TaskCard(QFrame):
             m.addAction("Add subtask…").triggered.connect(self._add_sub)
             m.addAction("Open in window").triggered.connect(
                 lambda _=False: self._app.open_task_window(self._task))
+            m.addAction("Show subtasks as tiles" if self._task.get("view") == "list"
+                        else "Show subtasks as list").triggered.connect(self._toggle_view)
             m.addSeparator()
             if self._task.get("waiting"):
                 m.addAction("Clear waiting").triggered.connect(self._clear_waiting)
             else:
-                m.addAction("Mark waiting…").triggered.connect(self._mark_waiting)
+                m.addAction("Mark waiting…  (blocks it)").triggered.connect(self._mark_waiting)
         m.addAction("Skip to back").triggered.connect(self._skip)
         m.addAction("Swap with queued…").triggered.connect(self._swap)
         if not rec:
             m.addSeparator()
             m.addAction("Save as template…").triggered.connect(self._save_template)
+            n_done = sum(1 for k in children_of(self._data, self._task["id"]) if k.get("completed"))
+            if n_done:
+                m.addAction(f"Archive {n_done} completed subtask{'s' if n_done != 1 else ''}"
+                            ).triggered.connect(self._archive_done_kids)
             m.addAction("Archive").triggered.connect(self._archive)
         m.addSeparator()
         m.addAction("Delete").triggered.connect(self._delete)
-        m.exec_(self.mapToGlobal(self.rect().center()))
+        m.exec_(pos if pos is not None else self.mapToGlobal(self.rect().center()))
+
+    def contextMenuEvent(self, e):
+        self._menu(e.globalPos())
+
+    def _toggle_view(self):
+        self._task["view"] = "tiles" if self._task.get("view") == "list" else "list"
+        save_data(self._data)
+        self._app.refresh()
+
+    def _archive_done_kids(self):
+        done = [k for k in children_of(self._data, self._task["id"]) if k.get("completed")]
+        if not done:
+            return
+        dlg = ConfirmDialog(self.window(),
+                            f"Archive {len(done)} completed subtask{'s' if len(done) != 1 else ''} "
+                            f"of “{self._task['title']}”? You can restore them later.", "Archive")
+        if dlg.exec_() == QDialog.Accepted:
+            self._app.snapshot(include_archive=True)
+            for k in done:
+                archive_task(self._data, k["id"])
+            save_data(self._data)
+            self._app.refresh()
 
     def _mark_waiting(self):
         dlg = TextPromptDialog(self.window(), "Mark waiting",
                                "What are you waiting on?", "")
         if dlg.exec_() == QDialog.Accepted:
             self._app.snapshot()
-            self._task["waiting"] = {"note": dlg.value(),
-                                     "since": datetime.now().isoformat()}
+            set_waiting(self._data, self._task, dlg.value())
             save_data(self._data)
             self._app.refresh()
 
     def _clear_waiting(self):
         self._app.snapshot()
-        self._task.pop("waiting", None)
+        clear_waiting(self._data, self._task)
         save_data(self._data)
         self._app.refresh()
 
@@ -836,11 +1021,22 @@ class TaskCard(QFrame):
         pm = self.grab()
         drag.setPixmap(pm.scaledToWidth(int(pm.width() * 0.85), Qt.SmoothTransformation))
         drag.setHotSpot(QPoint(20, 20))
-        eff = QGraphicsOpacityEffect(self); eff.setOpacity(0.35)
-        self.setGraphicsEffect(eff)
+        grid = self._grid
+        if grid is not None:
+            grid.drag_started(self)       # lift the card out; siblings close the gap
+        else:
+            eff = QGraphicsOpacityEffect(self); eff.setOpacity(0.35)
+            self.setGraphicsEffect(eff)
         drag.exec_(Qt.MoveAction)
-        self.setGraphicsEffect(None)
-        self._press_pos = None
+        # a drop usually rebuilt the grid, so we may already be scheduled for deletion
+        try:
+            if grid is not None:
+                grid.drag_ended(self)
+            else:
+                self.setGraphicsEffect(None)
+            self._press_pos = None
+        except RuntimeError:
+            pass
 
     def mouseReleaseEvent(self, e):
         if (e.button() == Qt.LeftButton and self._press_pos is not None
@@ -865,6 +1061,17 @@ class TaskCard(QFrame):
             return None                                    # would create a cycle
         return tid
 
+    def _zone(self, e):
+        if self.compact:                       # rows stack vertically → judge by y
+            y, h = e.pos().y(), max(self.height(), 1)
+            return ("before" if y < h * 0.35 else
+                    "after"  if y > h * 0.65 else
+                    ("nest" if self._allow_nest else "after"))
+        x, w = e.pos().x(), max(self.width(), 1)
+        return ("before" if x < w * 0.3 else
+                "after"  if x > w * 0.7 else
+                ("nest" if self._allow_nest else "after"))
+
     def dragEnterEvent(self, e):
         if self._payload(e):
             e.acceptProposedAction()
@@ -876,11 +1083,10 @@ class TaskCard(QFrame):
         if not tid:
             e.ignore(); return
         e.acceptProposedAction()
-        x, w = e.pos().x(), max(self.width(), 1)
-        zone = ("before" if x < w * 0.3 else
-                "after"  if x > w * 0.7 else
-                ("nest" if self._allow_nest else "after"))
+        zone = self._zone(e)
         self._show_zone(zone)
+        if self._grid is not None:            # open a landing gap beside us (iOS-style)
+            self._grid.set_gap(self if zone != "nest" else None, zone)
 
     def dragLeaveEvent(self, e):
         self._show_zone(None)
@@ -890,26 +1096,12 @@ class TaskCard(QFrame):
         self._show_zone(None)
         if not tid:
             e.ignore(); return
-        x, w = e.pos().x(), max(self.width(), 1)
-        zone = ("before" if x < w * 0.3 else
-                "after"  if x > w * 0.7 else
-                ("nest" if self._allow_nest else "after"))
+        zone = self._zone(e)
         e.acceptProposedAction()
         self.drop_action.emit(tid, self._task["id"], zone)
 
     def _show_zone(self, zone):
-        h = self.height()
-        self._ind_l.setGeometry(0, 4, 3, h - 8)
-        self._ind_r.setGeometry(self.width() - 3, 4, 3, h - 8)
-        self._ind_l.setVisible(zone == "before")
-        self._ind_r.setVisible(zone == "after")
-        if zone == "nest":
-            self.setStyleSheet(
-                f"#card {{ background: {SURF_H}; border: 1.5px solid {ACC}; border-radius: 8px; }}")
-        else:
-            self.setStyleSheet(
-                f"#card {{ background: {SURF}; border: 1px solid {BDR}; border-radius: 8px; }}"
-                f"#card:hover {{ background: {SURF_H}; border-color: {BDR_H}; }}")
+        self._base_style(nest_hover=(zone == "nest"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Card grid — manual flow layout; "focus" (no scroll) or "flow" (scroll) modes
@@ -944,24 +1136,104 @@ class SectionHeader(QWidget):
         e.acceptProposedAction()
 
 
+class _GridBox(QWidget):
+    """Canvas behind the cards. While a drag is open it accepts drops into the
+    gap (or the empty space past the last card) so you can let go anywhere."""
+    def __init__(self, grid):
+        super().__init__()
+        self._grid = grid
+        self.setAcceptDrops(True)
+        self.setStyleSheet("background: transparent;")
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(MIME):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if not e.mimeData().hasFormat(MIME):
+            e.ignore(); return
+        self._grid.hover_empty()
+        if self._grid.has_gap():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        if self._grid.drop_in_gap(e):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+
 class CardGrid(QScrollArea):
     def __init__(self, app, data, cfg, mode="focus", parent_id=None, recurring=False):
         super().__init__()
         self._app, self._data, self._cfg = app, data, cfg
         self.mode, self.parent_id, self.recurring = mode, parent_id, recurring
-        self._items = []          # (widget, kind) kind: card | header | label
+        self._items = []          # (widget, kind) kind: card | row | header | empty
         self._queued_chip = None
         self._built_cw, self._built_ch = 230, 150
         self._rebuild_scheduled = False
+        self._drag_src = None     # card lifted out of the layout during a drag
+        self._gap_target, self._gap_zone = None, None   # where the lifted card would land
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setVerticalScrollBarPolicy(
             Qt.ScrollBarAsNeeded if mode == "flow" else Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._box = QWidget()
-        self._box.setStyleSheet("background: transparent;")
+        self._box = _GridBox(self)
         self.setWidget(self._box)
         QTimer.singleShot(0, self.rebuild)
+
+    # ── drag gap (iOS home-screen style) ─────────────────────────────────────
+    def drag_started(self, card):
+        self._drag_src = card
+        card.hide()
+        self._relayout()
+
+    def drag_ended(self, card):
+        self._drag_src = None
+        self._gap_target, self._gap_zone = None, None
+        try:
+            if any(w is card for w, _ in self._items):
+                card.show()
+        except RuntimeError:
+            pass
+        self._relayout()
+
+    def set_gap(self, card, zone):
+        new = (card, zone) if card is not None else (None, None)
+        if new == (self._gap_target, self._gap_zone):
+            return
+        self._gap_target, self._gap_zone = new
+        self._relayout()
+
+    def has_gap(self):
+        return self._gap_target is not None
+
+    def hover_empty(self):
+        """Dragging over blank space in a single list → land after the last card."""
+        if self._gap_target is not None or self.mode == "focus":
+            return
+        cards = [w for w, k in self._items if k in ("card", "row") and w is not self._drag_src]
+        if cards:
+            self.set_gap(cards[-1], "after")
+
+    def drop_in_gap(self, e):
+        tgt, zone = self._gap_target, self._gap_zone
+        if tgt is None:
+            return False
+        try:
+            tid = tgt._payload(e)
+        except RuntimeError:
+            return False
+        if not tid:
+            return False
+        self._gap_target, self._gap_zone = None, None
+        tgt.drop_action.emit(tid, tgt._task["id"], zone)
+        return True
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -981,6 +1253,7 @@ class CardGrid(QScrollArea):
         for w, _ in self._items:
             w.deleteLater()
         self._items = []
+        self._gap_target, self._gap_zone = None, None
         if self._queued_chip:
             self._queued_chip.deleteLater(); self._queued_chip = None
         _, self._built_cw, self._built_ch, _, _ = self._card_dims()
@@ -1009,22 +1282,26 @@ class CardGrid(QScrollArea):
                 for t in items: self._add_card(t)
             if not any_items:
                 self._add_empty("All clear ✓\nAdd a task above to get started.")
-        else:  # flow — children of parent_id
+        else:  # flow — children of parent_id, as tiles or (per parent) a compact list
+            parent = task_by_id(self._data, self.parent_id) if self.parent_id else None
+            compact = bool(parent and parent.get("view") == "list")
             items = children_of(self._data, self.parent_id, include_done=False)
-            for t in items: self._add_card(t)
+            for t in items: self._add_card(t, compact=compact)
             if not items:
                 self._add_empty("Nothing here yet — add items above,\nor drag cards in to group them.")
         self._relayout()
 
-    def _add_card(self, t, allow_nest=True):
+    def _add_card(self, t, allow_nest=True, compact=False):
+        cw = max(300, self.viewport().width() - 24) if compact else self._built_cw
         c = TaskCard(t, self._data, self._app,
                      allow_nest=allow_nest and not self.recurring,
-                     card_w=self._built_cw, card_h=self._built_ch)
+                     card_w=cw, card_h=self._built_ch,
+                     compact=compact, grid=self)
         c.setParent(self._box)
         c.open_requested.connect(self._app.open_task)
         c.drop_action.connect(self._app.handle_drop)
         c.hide()
-        self._items.append((c, "card"))
+        self._items.append((c, "row" if compact else "card"))
 
     def _add_header(self, prio, text):
         if prio:
@@ -1052,7 +1329,7 @@ class CardGrid(QScrollArea):
         cols, cw, ch, m, g = self._card_dims()
         # card content was built for a different width class → rebuild denser/sparser
         if (abs(cw - self._built_cw) > 30
-                and any(k == "card" for _, k in self._items)
+                and any(k in ("card", "row") for _, k in self._items)
                 and not self._rebuild_scheduled):
             self._rebuild_scheduled = True
             QTimer.singleShot(0, self._rebuild_now)
@@ -1060,8 +1337,17 @@ class CardGrid(QScrollArea):
         y, col = m, 0
         hidden = 0
         limit_h = vh if self.mode == "focus" else 10 ** 9
+        gap_t, gap_z = self._gap_target, self._gap_zone
+
+        def skip_cell():
+            nonlocal col, y
+            col += 1
+            if col >= cols:
+                col = 0; y += ch + g
 
         for w, kind in self._items:
+            if w is self._drag_src:
+                w.hide(); continue                  # lifted out while dragging
             if kind in ("header", "empty"):
                 if col > 0:
                     y += ch + g; col = 0
@@ -1073,14 +1359,25 @@ class CardGrid(QScrollArea):
                     w.hide(); continue
                 w.setGeometry(m, y, vw - 2 * m, 18); w.show()
                 y += 18 + 6
+            elif kind == "row":
+                if gap_t is w and gap_z == "before":
+                    y += ROW_H + 4
+                if y + ROW_H > limit_h:
+                    w.hide(); hidden += 1; continue
+                w.setGeometry(m, y, vw - 2 * m, ROW_H); w.show()
+                y += ROW_H + 4
+                if gap_t is w and gap_z == "after":
+                    y += ROW_H + 4
             else:
+                if gap_t is w and gap_z == "before":
+                    skip_cell()
                 x = m + col * (cw + g)
                 if y + ch > limit_h:
                     w.hide(); hidden += 1; continue
                 w.setGeometry(x, y, cw, ch); w.show()
-                col += 1
-                if col >= cols:
-                    col = 0; y += ch + g
+                skip_cell()
+                if gap_t is w and gap_z == "after":
+                    skip_cell()
 
         total_h = y + (ch + g if col > 0 else 0) + m
         self._box.setMinimumHeight(total_h if self.mode == "flow" else 0)
@@ -1248,6 +1545,8 @@ class ConfirmDialog(BaseDialog):
         row = QHBoxLayout()
         ok = btn_danger(ok_label); ok.clicked.connect(self.accept)
         no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        ok.setAutoDefault(False)                 # Enter never confirms a destructive step
+        no.setAutoDefault(True); no.setDefault(True)
         row.addStretch(); row.addWidget(no); row.addWidget(ok)
         self.add_lay(row)
 
@@ -1262,6 +1561,7 @@ class TextPromptDialog(BaseDialog):
         row = QHBoxLayout()
         ok = btn_primary("OK"); ok.clicked.connect(self.accept)
         no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        ok.setDefault(True); no.setAutoDefault(False)
         row.addStretch(); row.addWidget(no); row.addWidget(ok)
         self.add_lay(row)
         self._edit.setFocus(); self._edit.selectAll()
@@ -1319,6 +1619,7 @@ class AddTaskDialog(BaseDialog):
         row = QHBoxLayout()
         ok = btn_primary("Add"); ok.clicked.connect(self._save)
         no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        ok.setDefault(True); no.setAutoDefault(False)
         row.addStretch(); row.addWidget(no); row.addWidget(ok)
         self.add_lay(row)
         self._title.setFocus()
@@ -1361,7 +1662,7 @@ class TaskDetailDialog(BaseDialog):
             if s["id"] == task.get("stage"):
                 self._stage.setCurrentIndex(self._stage.count() - 1)
         self.add(self._stage)
-        self.add(micro_label("Waiting on  (leave blank if not waiting)"))
+        self.add(micro_label("Waiting on  (marks it blocked · blank = not waiting)"))
         w = task.get("waiting") or {}
         self._waiting = QLineEdit(w.get("note", ""))
         wd = waiting_days(task)
@@ -1376,6 +1677,8 @@ class TaskDetailDialog(BaseDialog):
         de = btn_danger("Delete"); de.clicked.connect(self._delete)
         ok = btn_primary("Save"); ok.clicked.connect(self._save)
         no = btn_quiet("Cancel"); no.clicked.connect(self.reject)
+        de.setAutoDefault(False); no.setAutoDefault(False)
+        ok.setDefault(True)                      # Enter saves; Esc cancels
         row.addWidget(de); row.addStretch(); row.addWidget(no); row.addWidget(ok)
         self.add_lay(row)
         self._title.setFocus()
@@ -1386,15 +1689,17 @@ class TaskDetailDialog(BaseDialog):
         if t: self._task["title"] = t
         ch = self._grp.checkedButton()
         if ch: self._task["priority"] = ch.property("v")
-        self._task["stage"] = self._stage.currentData()
+        old_stage, new_stage = self._task.get("stage"), self._stage.currentData()
+        self._task["stage"] = new_stage
         self._task["notes"] = self._notes.toPlainText()
         wnote = self._waiting.text().strip()
-        old = self._task.get("waiting") or {}
+        bid = blocked_stage_id(self._data)
         if not wnote:
-            self._task.pop("waiting", None)
-        elif wnote != old.get("note"):
-            self._task["waiting"] = {"note": wnote,
-                                     "since": datetime.now().isoformat()}
+            clear_waiting(self._data, self._task)
+        elif bid and old_stage == bid and new_stage != bid:
+            self._task.pop("waiting", None)      # moved off Blocked → the wait is over
+        else:
+            set_waiting(self._data, self._task, wnote)
         save_data(self._data)
         self._app.refresh()
         self.accept()
@@ -1648,6 +1953,10 @@ class TaskWindow(BaseDialog):
         back = btn_icon("←", "Back", 26)
         back.clicked.connect(self._back)
         self.bar.center_slot.insertWidget(2, back)
+        self._view_b = btn_icon("☰", "Show as list", 26)
+        self._view_b.clicked.connect(self._toggle_view)
+        self.bar.center_slot.insertWidget(3, self._view_b)
+        self._sync_view_btn()
         self._quick = QLineEdit()
         self._quick.setPlaceholderText("＋  Add item…  (Enter)")
         self._quick.returnPressed.connect(self._quick_add)
@@ -1668,10 +1977,25 @@ class TaskWindow(BaseDialog):
             def _track(self, dlg): outer._app._track(dlg)
         return Proxy()
 
+    def _sync_view_btn(self):
+        t = task_by_id(self._data, self._pid)
+        lst = bool(t and t.get("view") == "list")
+        self._view_b.setText("⊞" if lst else "☰")
+        self._view_b.setToolTip("Show as tiles" if lst else "Show as list")
+
+    def _toggle_view(self):
+        t = task_by_id(self._data, self._pid)
+        if not t: return
+        t["view"] = "tiles" if t.get("view") == "list" else "list"
+        save_data(self._data)
+        self._sync_view_btn()
+        self._app.refresh()
+
     def _open(self, task):
         self._pid = task["id"]
         self._grid.parent_id = task["id"]
         self.bar.set_title(task["title"][:46])
+        self._sync_view_btn()
         self._grid.rebuild()
 
     def _back(self):
@@ -1683,6 +2007,7 @@ class TaskWindow(BaseDialog):
         pt = task_by_id(self._data, self._pid)
         self.bar.set_title((pt["title"] if pt else "Tasks")[:46])
         self._grid.parent_id = self._pid
+        self._sync_view_btn()
         self._grid.rebuild()
 
     def _quick_add(self):
@@ -1704,6 +2029,7 @@ class TaskWindow(BaseDialog):
                 self.close(); return
             self._pid = self._root
             self._grid.parent_id = self._root
+        self._sync_view_btn()
         self._grid.rebuild()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2446,7 +2772,7 @@ class QuickCaptureDialog(QDialog):
         self._app = app
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(440, 120)
+        self.resize(440, 150)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         frame = QFrame(); frame.setObjectName("qc")
@@ -2464,6 +2790,12 @@ class QuickCaptureDialog(QDialog):
         ef = self._edit.font(); ef.setPointSize(11); self._edit.setFont(ef)
         self._edit.returnPressed.connect(self._add)
         v.addWidget(self._edit)
+        tr = QHBoxLayout(); tr.setSpacing(8)
+        tr.addWidget(micro_label("Add to"))
+        self._target = QComboBox()
+        self._fill_targets()
+        tr.addWidget(self._target, 1)
+        v.addLayout(tr)
         hint = QLabel("Enter to add — keep typing to add more · Esc to close")
         hint.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
         v.addWidget(hint)
@@ -2471,13 +2803,30 @@ class QuickCaptureDialog(QDialog):
         self.move(s.center().x() - self.width() // 2,
                   s.top() + int(s.height() * 0.26))
 
+    def _fill_targets(self):
+        """Top level, every open top-level task, and the task that's open (or was
+        last open) in the main window — which is the default landing spot."""
+        d = self._app.data
+        cur = self._app.current_capture_target()
+        self._target.addItem("Tasks  (top level)", None)
+        for r in children_of(d, None, include_done=False):
+            self._target.addItem(r["title"][:60], r["id"])
+        if cur and task_by_id(d, cur) and self._target.findData(cur) < 0:
+            chain = ancestor_chain(d, cur) + [task_by_id(d, cur)]
+            self._target.insertItem(1, " › ".join(c["title"] for c in chain)[:70], cur)
+        idx = self._target.findData(cur) if cur else -1
+        self._target.setCurrentIndex(idx if idx >= 0 else 0)
+
     def _add(self):
         title = self._edit.text().strip()
         if not title:
             self.close(); return
+        pid = self._target.currentData()
+        if pid is not None and task_by_id(self._app.data, pid) is None:
+            pid = None                            # target vanished meanwhile → top level
         self._app.snapshot()
-        t = mk_task(title, "medium", None)
-        b = bucket(self._app.data, None, "medium")
+        t = mk_task(title, "medium", pid)
+        b = bucket(self._app.data, pid, "medium")
         t["order"] = max((x.get("order", 0) for x in b), default=-10) + 10
         self._app.data["tasks"].append(t)
         save_data(self._app.data)
@@ -2502,6 +2851,8 @@ class MainWindow(QMainWindow):
         self.notes = load_notes()
         self.pending_update = None
         self._parent_id = None
+        self._last_parent = None      # most recently drilled-into task (quick-capture default)
+        self._done_expanded = False
         self._children = []           # tracked non-modal windows
         self._undo_stack = []
         self._quitting = False
@@ -2686,10 +3037,16 @@ class MainWindow(QMainWindow):
         tasks_page = QWidget(); tasks_page.setStyleSheet("background: transparent;")
         tv = QVBoxLayout(tasks_page)
         tv.setContentsMargins(12, 8, 12, 6); tv.setSpacing(7)
+        crumb_row = QHBoxLayout(); crumb_row.setSpacing(6)
         self._crumb = Breadcrumb()
         self._crumb.navigate.connect(self.navigate)
         self._crumb.move_to.connect(self._move_to_ancestor)
-        tv.addWidget(self._crumb)
+        crumb_row.addWidget(self._crumb, 1)
+        self._view_btn = btn_icon("☰", "Show subtasks as a list", 26)
+        self._view_btn.clicked.connect(self._toggle_view)
+        self._view_btn.hide()
+        crumb_row.addWidget(self._view_btn)
+        tv.addLayout(crumb_row)
         self._quick = QLineEdit()
         self._quick.setPlaceholderText("＋  Quick add…  (Enter)")
         self._quick.returnPressed.connect(self._quick_add)
@@ -2759,7 +3116,11 @@ class MainWindow(QMainWindow):
         # guard against navigating into a deleted task
         if parent_id is not None and task_by_id(self.data, parent_id) is None:
             parent_id = None
+        if parent_id != self._parent_id:
+            self._done_expanded = False
         self._parent_id = parent_id
+        if parent_id is not None:
+            self._last_parent = parent_id
         self._grid.parent_id = parent_id
         self._grid.mode = "focus" if parent_id is None else "flow"
         self._grid.setVerticalScrollBarPolicy(
@@ -2768,8 +3129,32 @@ class MainWindow(QMainWindow):
         self._quick.setPlaceholderText(
             "＋  Quick add…  (Enter)" if parent_id is None
             else "＋  Add item here…  (Enter)")
+        self._update_view_btn()
         self._grid.rebuild()
         self._render_done_strip()
+
+    def current_capture_target(self):
+        """Where quick capture lands by default: the open task, else the last one opened."""
+        for pid in (self._parent_id, self._last_parent):
+            if pid and task_by_id(self.data, pid):
+                return pid
+        return None
+
+    def _update_view_btn(self):
+        t = task_by_id(self.data, self._parent_id) if self._parent_id else None
+        if not t:
+            self._view_btn.hide(); return
+        lst = t.get("view") == "list"
+        self._view_btn.setText("⊞" if lst else "☰")
+        self._view_btn.setToolTip("Show subtasks as tiles" if lst else "Show subtasks as a list")
+        self._view_btn.show()
+
+    def _toggle_view(self):
+        t = task_by_id(self.data, self._parent_id) if self._parent_id else None
+        if not t: return
+        t["view"] = "tiles" if t.get("view") == "list" else "list"
+        save_data(self.data)
+        self.refresh()
 
     def open_task(self, task):
         if self._searchbox.text().strip():
@@ -2905,7 +3290,8 @@ class MainWindow(QMainWindow):
         matches = [t for t in self.data["tasks"]
                    if not t.get("recurring") and not t.get("completed")
                    and (q in t["title"].lower() or q in (t.get("notes") or "").lower())]
-        matches.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), t.get("order", 0)))
+        rank = stage_ranker(self.data)
+        matches.sort(key=lambda t: (PRIO_ORDER.get(t["priority"], 1), rank(t), t.get("order", 0)))
         g._add_header(None, f"Search · {len(matches)} match{'es' if len(matches) != 1 else ''}")
         for t in matches[:60]:
             g._add_card(t)
@@ -2914,6 +3300,17 @@ class MainWindow(QMainWindow):
         g._relayout()
 
     # ── done strip (completed children in drilled view) ──────────────────────
+    DONE_PREVIEW = 4          # completed rows shown before "Show all"
+
+    def _link_btn(self, text, tip=""):
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor); b.setToolTip(tip)
+        b.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {DIM}; border: none; "
+            f"padding: 1px 6px; font-size: 8pt; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {ACC}; }}")
+        return b
+
     def _render_done_strip(self):
         while self._done_v.count():
             it = self._done_v.takeAt(0)
@@ -2923,11 +3320,26 @@ class MainWindow(QMainWindow):
         done = [t for t in children_of(self.data, self._parent_id) if t.get("completed")]
         if not done:
             return
-        self._done_v.addWidget(micro_label(f"Completed · {len(done)}"))
-        for t in done[:8]:
+        head = QWidget(); head.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(head); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(6)
+        hl.addWidget(micro_label(f"Completed · {len(done)}"))
+        hl.addStretch()
+        if len(done) > self.DONE_PREVIEW:
+            tog = self._link_btn("Show less" if self._done_expanded else f"Show all {len(done)}")
+            tog.clicked.connect(self._toggle_done)
+            hl.addWidget(tog)
+        arc = self._link_btn("Archive all", "Move every completed subtask here to the archive")
+        arc.clicked.connect(lambda _=False: self._archive_done_children(self._parent_id))
+        hl.addWidget(arc)
+        self._done_v.addWidget(head)
+
+        shown = done if self._done_expanded else done[:self.DONE_PREVIEW]
+        box = QWidget(); box.setStyleSheet("background: transparent;")
+        bv = QVBoxLayout(box); bv.setContentsMargins(0, 0, 0, 0); bv.setSpacing(3)
+        for t in shown:
             row = QFrame()
             row.setStyleSheet(f"QFrame {{ background: {SURF2}; border: none; border-radius: 5px; }}")
-            rl = QHBoxLayout(row); rl.setContentsMargins(7, 2, 7, 2); rl.setSpacing(7)
+            rl = QHBoxLayout(row); rl.setContentsMargins(7, 2, 4, 2); rl.setSpacing(7)
             ck = QCheckBox(); ck.setChecked(True)
 
             def untick(state, task=t):
@@ -2941,11 +3353,42 @@ class MainWindow(QMainWindow):
             lab = QLabel(t["title"])
             lab.setStyleSheet(f"color: {FAINT}; text-decoration: line-through; background: transparent;")
             rl.addWidget(lab, 1)
-            self._done_v.addWidget(row)
-        if len(done) > 8:
-            more = QLabel(f"  +{len(done) - 8} more in All tasks")
-            more.setStyleSheet(f"color: {FAINT}; font-size: 8pt;")
-            self._done_v.addWidget(more)
+            ar = btn_icon("🗄", "Archive this subtask", 22)
+            ar.clicked.connect(lambda _=False, tid=t["id"]: self._archive_one(tid))
+            rl.addWidget(ar)
+            bv.addWidget(row)
+        if self._done_expanded and len(shown) > 6:
+            sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+            sc.setWidget(box); sc.setMaximumHeight(200)
+            self._done_v.addWidget(sc)
+        else:
+            self._done_v.addWidget(box)
+
+    def _toggle_done(self):
+        self._done_expanded = not self._done_expanded
+        self._render_done_strip()
+
+    def _archive_one(self, tid):
+        if task_by_id(self.data, tid) is None:
+            return
+        self.snapshot(include_archive=True)
+        archive_task(self.data, tid)
+        save_data(self.data)
+        self.refresh()
+
+    def _archive_done_children(self, pid):
+        done = [t for t in children_of(self.data, pid) if t.get("completed")] if pid else []
+        if not done:
+            return
+        n = len(done)
+        if ConfirmDialog(self, f"Archive {n} completed subtask{'s' if n != 1 else ''}? "
+                               f"You can restore them later from the archive.",
+                         "Archive").exec_() == QDialog.Accepted:
+            self.snapshot(include_archive=True)
+            for t in done:
+                archive_task(self.data, t["id"])
+            save_data(self.data)
+            self.refresh()
 
     # ── refresh fan-out ──────────────────────────────────────────────────────
     def refresh(self):
@@ -2960,6 +3403,7 @@ class MainWindow(QMainWindow):
         if self._stack.currentIndex() == 1:
             self._rec_grid.rebuild()
         self._crumb.set_path(self.data, self._parent_id)
+        self._update_view_btn()
         self._render_done_strip()
         self.update_meta()
         for w in list(self._children):
